@@ -35,6 +35,7 @@ agent-box off [host]       # shut a Windows/WSL host down remotely
 | `--host NAME` | `pc` | Tailscale name of the host |
 | `--user NAME` | asked | Linux user on the host (clients only) |
 | `--vault NAME` | `Agents` | Proton Pass vault agents may read |
+| `--autonomous on\|off` | `off` | Claude works without permission prompts inside its sandbox (see below) |
 
 `install` saves the options to `~/.config/agent-box/config`, so later runs need no flags. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_USER` and `PASS_VAULT` work too.
 
@@ -119,6 +120,17 @@ Use `./setup.sh install --user <linux user on pc>` the first time. This adds `Ho
 | Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
 | Game | Just play. `wsl --shutdown` first if you want the RAM back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
+
+## Autonomous mode
+
+`agent-box install --autonomous on` lets Claude work without stopping for approval, on any machine and OS. It's saved, so later runs keep it on. It merges this into `~/.claude/settings.json`, leaving your other settings alone and keeping a backup in `settings.json.bak`:
+
+- **Sandbox on:** Bash commands run inside Claude's sandbox (bubblewrap on Linux/WSL, built in on macOS) and need no approval.
+- **No escape:** commands can't fall back to running outside the sandbox, and Claude refuses to start if the sandbox is unavailable instead of silently running without it.
+- **Edits auto-approved:** file edits don't ask (`acceptEdits`).
+- **Network allowlist:** sandboxed commands may reach the hosts in [claude/allowed-domains.txt](claude/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file and run `agent-box sync`.
+
+`--autonomous off` stops managing these settings but doesn't remove them. Undo with `/sandbox` inside Claude or by restoring `settings.json.bak`.
 
 ## Secrets: Proton Pass agent tokens
 

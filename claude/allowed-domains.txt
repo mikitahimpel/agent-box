@@ -1,0 +1,29 @@
+# Hosts sandboxed commands may reach without a prompt in autonomous mode.
+# One per line; *.example.com covers subdomains. Run `agent-box sync` after editing.
+# Domains are only ever added to ~/.claude/settings.json, never removed.
+
+# GitHub
+github.com
+*.github.com
+*.githubusercontent.com
+
+# JavaScript
+registry.npmjs.org
+*.npmjs.org
+registry.yarnpkg.com
+bun.sh
+
+# Python
+pypi.org
+files.pythonhosted.org
+
+# Rust
+crates.io
+*.crates.io
+
+# Go
+proxy.golang.org
+sum.golang.org
+
+# Proton Pass (pp / pass-cli)
+*.proton.me

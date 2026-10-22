@@ -11,9 +11,11 @@
 #   --host NAME             Tailscale name of the host (default: pc)
 #   --user NAME             Linux user on the host, for clients (asked if missing)
 #   --vault NAME            Proton Pass vault agents may read (default: Agents)
+#   --autonomous on|off     Claude works without prompts inside its sandbox (default: off)
 #
 # A "host" runs agents, a "client" is where you work from. The environment
-# variables AGENT_ROLE, AGENT_HOST, AGENT_USER and PASS_VAULT work too.
+# variables AGENT_ROLE, AGENT_HOST, AGENT_USER, PASS_VAULT and AGENT_AUTONOMOUS
+# work too.
 # Written for bash 3.2 so it runs on stock macOS.
 
 set -uo pipefail
@@ -39,6 +41,7 @@ ROLE="${AGENT_ROLE:-$(config_get AGENT_ROLE)}"
 AGENT_HOST="${AGENT_HOST:-$(config_get AGENT_HOST)}"
 AGENT_USER="${AGENT_USER:-$(config_get AGENT_USER)}"
 PASS_VAULT="${PASS_VAULT:-$(config_get PASS_VAULT)}"
+AUTONOMOUS="${AGENT_AUTONOMOUS:-$(config_get AGENT_AUTONOMOUS)}"
 
 TOKEN_SERVICE="proton-pass-agent"
 TOKEN_FILE="$HOME/.config/pass-agent/token"
@@ -301,12 +304,59 @@ install_shared_claude() {
   done
 }
 
+# Autonomous mode: Bash runs inside Claude's sandbox without prompts, file edits
+# are auto-approved, and Claude refuses to start if the sandbox is unavailable.
+# Hosts outside allowedDomains still prompt; add them to claude/allowed-domains.txt.
+autonomous_settings() {
+  local domains
+  domains="$(grep -Ev '^[[:space:]]*(#|$)' "$SHARED_CLAUDE/allowed-domains.txt" 2>/dev/null | jq -R . | jq -s .)"
+  jq -n --argjson domains "${domains:-[]}" '{
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      allowUnsandboxedCommands: false,
+      autoAllowBashIfSandboxed: true,
+      network: { allowedDomains: $domains }
+    },
+    permissions: { defaultMode: "acceptEdits" }
+  }'
+}
+# Current settings with autonomous mode merged in; domains are added, never removed.
+merged_claude_settings() {
+  local current="{}"
+  [ -s "$CLAUDE_SETTINGS" ] && current="$(cat "$CLAUDE_SETTINGS")"
+  printf '%s' "$current" | jq --argjson want "$(autonomous_settings)" '
+    (.sandbox.network.allowedDomains // []) as $have
+    | . * $want
+    | .sandbox.network.allowedDomains = (($have + $want.sandbox.network.allowedDomains) | unique)
+  '
+}
+check_autonomous() {
+  [ -s "$CLAUDE_SETTINGS" ] || return 1
+  [ "$(merged_claude_settings | jq -S .)" = "$(jq -S . "$CLAUDE_SETTINGS" 2>/dev/null)" ]
+}
+install_autonomous() {
+  local tmp
+  tmp="$(mktemp)"
+  merged_claude_settings > "$tmp" || { rm -f "$tmp"; return 1; }
+  mkdir -p "$CLAUDE_DIR"
+  [ -f "$CLAUDE_SETTINGS" ] && cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak"
+  mv "$tmp" "$CLAUDE_SETTINGS"
+}
+
+check_bwrap_works() { bwrap --ro-bind / / true >/dev/null 2>&1; }
+install_bwrap_works() {
+  info "bubblewrap can't create a sandbox here. On Ubuntu 24.04+ AppArmor may block it;"
+  info "see Troubleshooting at https://code.claude.com/docs/en/sandboxing"
+  return 1
+}
+
 check_agent_box_cmd() { [ "$(readlink "$BIN_DIR/agent-box" 2>/dev/null)" = "$SCRIPT" ]; }
 install_agent_box_cmd() { mkdir -p "$BIN_DIR" && ln -sfn "$SCRIPT" "$BIN_DIR/agent-box"; }
 
 config_body() {
-  printf 'AGENT_ROLE=%s\nAGENT_HOST=%s\nAGENT_USER=%s\nPASS_VAULT=%s\n' \
-    "$ROLE" "$AGENT_HOST" "$AGENT_USER" "$PASS_VAULT"
+  printf 'AGENT_ROLE=%s\nAGENT_HOST=%s\nAGENT_USER=%s\nPASS_VAULT=%s\nAGENT_AUTONOMOUS=%s\n' \
+    "$ROLE" "$AGENT_HOST" "$AGENT_USER" "$PASS_VAULT" "$AUTONOMOUS"
 }
 check_config_saved() { [ -f "$CONFIG_FILE" ] && config_body | cmp -s - "$CONFIG_FILE"; }
 install_config_saved() { mkdir -p "$(dirname "$CONFIG_FILE")" && config_body > "$CONFIG_FILE"; }
@@ -498,6 +548,7 @@ while [ $# -gt 0 ]; do
     --host) AGENT_HOST="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
     --vault) PASS_VAULT="${2:-}"; shift ;;
+    --autonomous) AUTONOMOUS="${2:-}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -510,7 +561,9 @@ if [ -z "$ROLE" ]; then
 fi
 AGENT_HOST="${AGENT_HOST:-pc}"
 PASS_VAULT="${PASS_VAULT:-Agents}"
+AUTONOMOUS="${AUTONOMOUS:-off}"
 case "$ROLE" in host|client) ;; *) die "--role must be host or client" ;; esac
+case "$AUTONOMOUS" in on|off) ;; *) die "--autonomous must be on or off" ;; esac
 [ "$ROLE" = host ] && [ "$PLATFORM" = mac ] && die "macOS is supported as a client only"
 
 if [ "$MODE" = off ]; then
@@ -522,7 +575,7 @@ if [ "$MODE" = sync ]; then
   MODE=install
 fi
 
-printf 'agent-box · %s · role: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$MODE"
+printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
 
 section "Base"
 step "curl, git, jq"                      check_base_tools          install_base_tools
@@ -557,8 +610,14 @@ step "Claude Code"                        check_claude              install_clau
 step "herdr"                              check_herdr               install_herdr
 have herdr && step "herdr ↔ Claude integration" check_herdr_claude install_herdr_claude
 step "shared Claude config (claude/ in this repo)" check_shared_claude install_shared_claude
-if [ "$ROLE" = host ]; then
+if [ "$PLATFORM" != mac ] && { [ "$ROLE" = host ] || [ "$AUTONOMOUS" = on ]; }; then
   step "Claude sandbox deps (bubblewrap, socat)" check_sandbox_deps install_sandbox_deps
+  have bwrap && step "bubblewrap can create sandboxes" check_bwrap_works install_bwrap_works
+fi
+if [ "$AUTONOMOUS" = on ]; then
+  step "Claude autonomous mode (sandboxed, no prompts)" check_autonomous install_autonomous
+fi
+if [ "$ROLE" = host ]; then
   step "herdr panes use login shells"     check_herdr_shell_mode    install_herdr_shell_mode
   if [ "$SYSTEMD" = 1 ]; then
     step "herdr server starts at boot"    check_herdr_service       install_herdr_service
