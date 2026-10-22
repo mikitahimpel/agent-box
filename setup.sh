@@ -351,6 +351,87 @@ install_bwrap_works() {
   return 1
 }
 
+# ---------------------------------------------------------------- github
+
+# Each machine gets its own SSH key on GitHub, so a lost machine is cut off by
+# deleting one key. Any key that already works (ssh-agent, Keychain, a custom
+# IdentityFile) is left alone.
+
+check_gh() { have gh; }
+install_gh() {
+  case "$PLATFORM" in
+    mac)
+      if have brew; then brew install gh
+      else info "install the GitHub CLI (https://cli.github.com), then rerun"; return 1; fi ;;
+    *) apt_install gh ;;
+  esac
+}
+
+check_gh_auth() { gh auth status -h github.com >/dev/null 2>&1; }
+install_gh_auth() {
+  need_tty || return 1
+  gh auth login -h github.com -p ssh --skip-ssh-key -s admin:public_key -w
+}
+
+check_gh_protocol() { [ "$(gh config get -h github.com git_protocol 2>/dev/null)" = ssh ]; }
+install_gh_protocol() { gh config set -h github.com git_protocol ssh; }
+
+# The first default key ssh offers, if any.
+github_pubkey() {
+  local k
+  for k in id_ed25519 id_ecdsa id_rsa; do
+    [ -f "$HOME/.ssh/$k.pub" ] && { echo "$HOME/.ssh/$k.pub"; return 0; }
+  done
+  return 1
+}
+github_has_key() {
+  local key
+  key="$(cut -d' ' -f1,2 "$1")"
+  gh api user/keys --jq '.[].key' 2>/dev/null | grep -xF "$key" >/dev/null
+}
+
+# ssh -T to GitHub always exits 1, so look at the greeting instead.
+check_github_ssh() {
+  local out
+  out="$(ssh -T -o BatchMode=yes -o ConnectTimeout=10 git@github.com </dev/null 2>&1)"
+  case "$out" in *"successfully authenticated"*) return 0 ;; esac
+  return 1
+}
+install_github_ssh() {
+  have gh && check_gh_auth || { info "needs gh logged in to GitHub first"; return 1; }
+  local pub
+  if ! pub="$(github_pubkey)"; then
+    pub="$HOME/.ssh/id_ed25519.pub"
+    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+    ssh-keygen -q -t ed25519 -N "" -C "agent-box $(hostname)" -f "${pub%.pub}" || return 1
+  fi
+  if ! gh api user/keys >/dev/null 2>&1; then
+    need_tty || return 1
+    info "gh needs permission to add SSH keys to your account"
+    gh auth refresh -h github.com -s admin:public_key || return 1
+  fi
+  if ! github_has_key "$pub"; then
+    gh ssh-key add "$pub" --title "agent-box $(hostname)" || return 1
+  fi
+  ssh -T -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
+    git@github.com </dev/null >/dev/null 2>&1
+  check_github_ssh || info "$pub is on GitHub but ssh can't use it; if it has a passphrase, ssh-add it"
+  return 0
+}
+
+check_git_identity() { [ -n "$(git config --global user.name)" ] && [ -n "$(git config --global user.email)" ]; }
+install_git_identity() {
+  have gh && check_gh_auth || { info "set git config --global user.name / user.email"; return 1; }
+  local user name login id
+  user="$(gh api user)" || return 1
+  name="$(printf '%s' "$user" | jq -r '.name // .login')"
+  login="$(printf '%s' "$user" | jq -r .login)"
+  id="$(printf '%s' "$user" | jq -r .id)"
+  [ -n "$(git config --global user.name)" ] || git config --global user.name "$name"
+  [ -n "$(git config --global user.email)" ] \
+    || git config --global user.email "$id+$login@users.noreply.github.com"
+}
+
 check_agent_box_cmd() { [ "$(readlink "$BIN_DIR/agent-box" 2>/dev/null)" = "$SCRIPT" ]; }
 install_agent_box_cmd() { mkdir -p "$BIN_DIR" && ln -sfn "$SCRIPT" "$BIN_DIR/agent-box"; }
 
@@ -625,6 +706,15 @@ if [ "$ROLE" = host ]; then
   fi
 fi
 
+section "GitHub"
+step "GitHub CLI (gh)"                    check_gh                  install_gh
+if have gh; then
+  step "gh logged in to GitHub"           check_gh_auth             install_gh_auth
+  step "gh uses SSH for git"              check_gh_protocol         install_gh_protocol
+fi
+step "git over SSH to GitHub"             check_github_ssh          install_github_ssh
+step "git name and email"                 check_git_identity        install_git_identity
+
 section "Secrets (Proton Pass)"
 step "pass-cli"                           check_pass_cli            install_pass_cli
 step "agent token stored"                 check_token               install_token
@@ -654,7 +744,7 @@ fi
 if [ "$ROLE" = host ]; then
   note "Tailscale admin console: disable key expiry for '$AGENT_HOST'."
   note "Tailscale admin console → Access controls: SSH rule action \"accept\" (see README)."
-  note "Inside WSL, log in once: 'claude', and 'gh auth login' if agents push to GitHub."
+  note "Log in to Claude once on this machine: run 'claude'."
 fi
 
 printf '\n%d ok · %d installed · %d missing · %d failed\n' "$N_OK" "$N_FIXED" "$N_MISSING" "$N_FAILED"

@@ -82,11 +82,12 @@ gh repo clone mikitahimpel/agent-box ~/agent-box
 cd ~/agent-box
 ./setup.sh install
 ```
-`gh auth login` also covers the GitHub login agents need later.
+This first `gh auth login` is only to clone the private repo. `setup.sh` takes GitHub access from there (see [GitHub](#github)).
 The first run writes `/etc/wsl.conf` (systemd on, Windows drives hidden from agents) and asks you to run `wsl --shutdown` in PowerShell. Reopen Ubuntu and run `./setup.sh install` again to finish:
 - Tailscale with **Tailscale SSH**, named `pc` (opens a login link the first time)
 - herdr, plus its server as a systemd user service with linger, so it runs without a login
 - Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
+- GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
 - Proton Pass CLI, the agent token (asked once) and the `pp` wrapper
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
@@ -131,6 +132,17 @@ Use `./setup.sh install --user <linux user on pc>` the first time. This adds `Ho
 - **Network allowlist:** sandboxed commands may reach the hosts in [claude/allowed-domains.txt](claude/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file and run `agent-box sync`.
 
 `--autonomous off` stops managing these settings but doesn't remove them. Undo with `/sandbox` inside Claude or by restoring `settings.json.bak`.
+
+## GitHub
+
+Every machine pushes over SSH with its **own** key, so if one machine is lost you delete only its key under **GitHub → Settings → SSH keys** (titled `agent-box <hostname>`). Each part is checked first and left alone if it already works:
+
+1. `gh` installed and logged in (`gh auth login`, browser or device code).
+2. `gh` set to use SSH for git, so `gh repo clone` gives SSH remotes.
+3. `ssh -T git@github.com` authenticates. If it already does (any key, ssh-agent, Keychain), nothing changes. Otherwise it uses `~/.ssh/id_ed25519` (or `id_ecdsa` / `id_rsa`), creates an ed25519 key without a passphrase if there is none, and uploads it with `gh ssh-key add`. Uploading needs the `admin:public_key` scope; `gh` asks for it once if your login lacks it.
+4. `git config --global user.name` and `user.email`, only if unset: your GitHub name and your `…@users.noreply.github.com` address.
+
+The keys have no passphrase so agents can push with nobody at the keyboard. They are deliberately not kept in Proton Pass: the stored agent token would unlock them just as easily, and a per-machine key is quicker to revoke than a shared one.
 
 ## Secrets: Proton Pass agent tokens
 
