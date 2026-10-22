@@ -9,25 +9,34 @@ Mac: herdr (Local + "pc") ──ssh over Tailscale──▶ pc = WSL Ubuntu
                                                      tailscaled (Tailscale SSH)
                                                      herdr server (systemd user service)
                                                      Claude Code, projects in ~/
-Windows host: games · WSL keepalive task · Wi-Fi watchdog task
+Windows host: games · WSL keepalive · Wi-Fi watchdog · remote shutdown · weekly WSL snapshot
 ```
 
 ## What's in this repo
 
 | File | Runs on | Does |
 |---|---|---|
-| `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. |
-| `windows/setup.ps1` | Windows (admin PowerShell) | Configures power, Wi-Fi, WSL memory, the keepalive task and the watchdog task. |
+| `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
+| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks. |
+| `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
 
 Both scripts only check by default and report what's missing. Add `install` (or `-Install` on Windows) to apply changes.
 
 ```bash
-./setup.sh                       # check
-./setup.sh install               # fix
-./setup.sh install --role client # force a role (default: macOS = client, WSL/Linux = host)
+agent-box                  # check (before the first install: ./setup.sh)
+agent-box install          # fix
+agent-box sync             # git pull this repo, then install
+agent-box off [host]       # shut a Windows/WSL host down remotely
 ```
 
-Settings come from environment variables: `AGENT_HOST` (default `pc`), `AGENT_USER` (Linux user on the host, asked if missing), `PASS_VAULT` (default `Agents`).
+| Option | Default | Meaning |
+|---|---|---|
+| `--role host\|client` | macOS = client, WSL/Linux = host | Which role this machine plays |
+| `--host NAME` | `pc` | Tailscale name of the host |
+| `--user NAME` | asked | Linux user on the host (clients only) |
+| `--vault NAME` | `Agents` | Proton Pass vault agents may read |
+
+`install` saves the options to `~/.config/agent-box/config`, so later runs need no flags. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_USER` and `PASS_VAULT` work too.
 
 ## Setup order
 
@@ -52,6 +61,10 @@ This sets:
 - WSL memory capped at half your RAM
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
+- a **remote shutdown** task that turns Windows off after `agent-box off` (checks every minute)
+- a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. Change it with `-BackupDir D:\wsl-backups -BackupKeep 5`.
+
+The tasks that touch WSL run as your Windows user before anyone logs in, so the script asks for your Windows password once.
 
 If WSL isn't installed yet, it installs Ubuntu. Reboot, open Ubuntu once to create your Linux user, then rerun the script.
 
@@ -73,7 +86,9 @@ The first run writes `/etc/wsl.conf` (systemd on, Windows drives hidden from age
 - Tailscale with **Tailscale SSH**, named `pc` (opens a login link the first time)
 - herdr, plus its server as a systemd user service with linger, so it runs without a login
 - Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
-- Proton Pass CLI, the agent token (asked once), the `pp` wrapper and the secrets section in `~/.claude/CLAUDE.md`
+- Proton Pass CLI, the agent token (asked once) and the `pp` wrapper
+- the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
+- links for the shared skills, commands and agents from `claude/`
 
 Then log in to Claude once inside WSL by running `claude`.
 
@@ -91,7 +106,7 @@ Then log in to Claude once inside WSL by running `claude`.
 ```bash
 ./setup.sh install
 ```
-This adds `Host pc` to `~/.ssh/config`, accepts the PC's host key, saves `pc` as a herdr machine, and sets up the same Proton Pass agent access as the host. The PC must be on for the last two steps.
+Use `./setup.sh install --user <linux user on pc>` the first time. This adds `Host pc` to `~/.ssh/config`, accepts the PC's host key, saves `pc` as a herdr machine, and sets up the same Proton Pass agent access as the host. The PC must be on for the last two steps.
 
 ## Daily use
 
@@ -99,7 +114,9 @@ This adds `Host pc` to `~/.ssh/config`, accepts the PC's host key, saves `pc` as
 |---|---|
 | Start | Press the power button. **pc** comes online in herdr in about 1–2 min. |
 | Work | Open panes under **pc** in herdr on the Mac. Agents keep running when the Mac closes. |
-| Stop | Short press of the power button (Windows shuts down cleanly). |
+| Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. |
+| Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
+| Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
 | Game | Just play. `wsl --shutdown` first if you want the RAM back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
 
@@ -125,6 +142,15 @@ Check what agents read with `pass-cli agent monitor <token-name>` (logged in as 
 
 **Note:** anything running as your user, agents included, can read the stored token. Only put in the vault what you're fine with an agent seeing.
 
+## Restoring WSL from a snapshot
+
+If an agent breaks the Ubuntu install, in PowerShell:
+```powershell
+wsl --unregister Ubuntu                      # deletes the broken install
+wsl --import Ubuntu $env:USERPROFILE\wsl\Ubuntu $env:USERPROFILE\wsl-backups\Ubuntu-<date>.tar
+```
+Then set your default user again in WSL (`/etc/wsl.conf` → `[user]` `default=<you>`) and run `wsl --shutdown`. The snapshot includes everything in Ubuntu: projects, tokens and logins.
+
 ## Acceptance test
 
 Repeat 5–10 times: shut the PC down, press the power button, don't touch it. It passes if **pc** comes online in herdr on your Mac every time and you can open a pane and run `claude`.
@@ -138,4 +164,6 @@ If it doesn't come online:
 
 - The Windows script is written for Windows PowerShell 5.1 but hasn't been run on a real machine yet. Read its check output before trusting it.
 - `pp` assumes `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
-- If you change your Windows password, delete the `agent-box WSL keepalive` task and rerun `windows\setup.ps1 -Install`.
+- If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and rerun `windows\setup.ps1 -Install`.
+- `wsl --export` of a running distro and the shutdown task's call into WSL are untested on a real PC. Check Task Scheduler's "Last Run Result" after the first week.
+- Snapshots are full copies of Ubuntu and can be large. Point `-BackupDir` at a drive with room.

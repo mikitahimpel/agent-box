@@ -1,33 +1,55 @@
 #!/usr/bin/env bash
 # Checks and installs the agent-box setup on macOS, Linux and WSL.
 #
-#   ./setup.sh               check only, change nothing
-#   ./setup.sh install       install or fix everything that is missing
-#   ./setup.sh install --role host|client
+#   agent-box               check only, change nothing (same as ./setup.sh)
+#   agent-box install       install or fix everything that is missing
+#   agent-box sync          git pull this repo, then install
+#   agent-box off [host]    shut a Windows/WSL host down (default: the configured host)
 #
-# Roles: "host" is the machine agents run on (WSL/Linux, reachable as $AGENT_HOST),
-# "client" is the machine you work from (your Mac). Defaults: macOS -> client,
-# WSL/Linux -> host.
+# Options (install saves them to ~/.config/agent-box/config for later runs):
+#   --role host|client      default: macOS -> client, WSL/Linux -> host
+#   --host NAME             Tailscale name of the host (default: pc)
+#   --user NAME             Linux user on the host, for clients (asked if missing)
+#   --vault NAME            Proton Pass vault agents may read (default: Agents)
 #
-# Settings (environment variables):
-#   AGENT_HOST  Tailscale name of the host           (default: pc)
-#   AGENT_USER  Linux user on the host, client only  (asked if missing)
-#   PASS_VAULT  Proton Pass vault agents may read    (default: Agents)
-#
+# A "host" runs agents, a "client" is where you work from. The environment
+# variables AGENT_ROLE, AGENT_HOST, AGENT_USER and PASS_VAULT work too.
 # Written for bash 3.2 so it runs on stock macOS.
 
 set -uo pipefail
 
-AGENT_HOST="${AGENT_HOST:-pc}"
-AGENT_USER="${AGENT_USER:-}"
-PASS_VAULT="${PASS_VAULT:-Agents}"
+# Follows symlinks without readlink -f, which older macOS lacks.
+resolve_path() {
+  local p="$1" t
+  while [ -L "$p" ]; do
+    t="$(readlink "$p")"
+    case "$t" in /*) p="$t" ;; *) p="$(dirname "$p")/$t" ;; esac
+  done
+  echo "$p"
+}
+SCRIPT="$(resolve_path "$0")"
+REPO_DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
+SCRIPT="$REPO_DIR/$(basename "$SCRIPT")"
+
+CONFIG_FILE="$HOME/.config/agent-box/config"
+config_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | tail -n 1; }
+
+# Precedence: command-line flags, then environment, then saved config, then defaults.
+ROLE="${AGENT_ROLE:-$(config_get AGENT_ROLE)}"
+AGENT_HOST="${AGENT_HOST:-$(config_get AGENT_HOST)}"
+AGENT_USER="${AGENT_USER:-$(config_get AGENT_USER)}"
+PASS_VAULT="${PASS_VAULT:-$(config_get PASS_VAULT)}"
 
 TOKEN_SERVICE="proton-pass-agent"
 TOKEN_FILE="$HOME/.config/pass-agent/token"
 BIN_DIR="$HOME/.local/bin"
 HERDR_CONFIG="$HOME/.config/herdr/config.toml"
 HERDR_UNIT="$HOME/.config/systemd/user/herdr.service"
-CLAUDE_MD="$HOME/.claude/CLAUDE.md"
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
+SHARED_CLAUDE="$REPO_DIR/claude"
+SHUTDOWN_FLAG="$HOME/.agent-box/shutdown"
 SSH_CONFIG="$HOME/.ssh/config"
 MARK_START="# >>> agent-box >>>"
 MARK_END="# <<< agent-box <<<"
@@ -35,7 +57,6 @@ MARK_END="# <<< agent-box <<<"
 export PATH="$BIN_DIR:$HOME/.claude/local:$PATH"
 
 MODE=check
-ROLE=""
 
 # ---------------------------------------------------------------- output
 
@@ -208,7 +229,13 @@ EOF
 check_pp() { [ -x "$BIN_DIR/pp" ] && pp_script | cmp -s - "$BIN_DIR/pp"; }
 install_pp() { mkdir -p "$BIN_DIR" && pp_script > "$BIN_DIR/pp" && chmod 755 "$BIN_DIR/pp"; }
 
+# The managed CLAUDE.md block: shared instructions from the repo, then the
+# generated sections. Rerun install after editing claude/CLAUDE.md.
 claude_md_block() {
+  if [ -s "$SHARED_CLAUDE/CLAUDE.md" ]; then
+    cat "$SHARED_CLAUDE/CLAUDE.md"
+    echo
+  fi
   cat <<EOF
 ## Secrets
 - Secrets live in Proton Pass vault "$PASS_VAULT". Never hardcode, log or print them.
@@ -216,11 +243,98 @@ claude_md_block() {
 - Run commands that need secrets via: \`pp run --env-file .env -- <command>\`
 - Set PROTON_PASS_AGENT_REASON to a short reason before reading secrets.
 EOF
+  if [ "$ROLE" = host ]; then
+    cat <<EOF
+
+## Dev servers
+- This machine is reached over Tailscale as "$AGENT_HOST". Bind dev servers to 0.0.0.0
+  (for example \`--host 0.0.0.0\`) so they open from the user's other machines.
+- When a server is up, give the user its URL as http://$AGENT_HOST:<port>.
+EOF
+  fi
 }
 check_claude_md() { block_matches "$CLAUDE_MD" "$(claude_md_block)"; }
 install_claude_md() { replace_block "$CLAUDE_MD" "$(claude_md_block)"; }
 
 check_pp_works() { "$BIN_DIR/pp" info >/dev/null 2>&1; }
+
+# Shared skills, commands and agents live in claude/<kind>/<name> in this repo
+# and are symlinked into ~/.claude/<kind>/<name>.
+SHARED_KINDS="skills commands agents"
+shared_items() {
+  local kind item
+  for kind in $SHARED_KINDS; do
+    for item in "$SHARED_CLAUDE/$kind"/*; do
+      [ -e "$item" ] && echo "$kind/$(basename "$item")"
+    done
+  done
+}
+# Links into this repo whose target was deleted from the repo.
+stale_shared_links() {
+  local kind link target
+  for kind in $SHARED_KINDS; do
+    for link in "$CLAUDE_DIR/$kind"/*; do
+      [ -L "$link" ] || continue
+      target="$(readlink "$link")"
+      case "$target" in "$SHARED_CLAUDE/"*) [ -e "$target" ] || echo "$link" ;; esac
+    done
+  done
+}
+check_shared_claude() {
+  local rel
+  for rel in $(shared_items); do
+    [ "$(readlink "$CLAUDE_DIR/$rel" 2>/dev/null)" = "$SHARED_CLAUDE/$rel" ] || return 1
+  done
+  [ -z "$(stale_shared_links)" ]
+}
+install_shared_claude() {
+  local rel target link
+  for link in $(stale_shared_links); do rm -f "$link"; done
+  for rel in $(shared_items); do
+    target="$CLAUDE_DIR/$rel"
+    [ "$(readlink "$target" 2>/dev/null)" = "$SHARED_CLAUDE/$rel" ] && continue
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      info "~/.claude/$rel exists and isn't from agent-box; move it into claude/$rel or delete it"
+      return 1
+    fi
+    mkdir -p "$(dirname "$target")" && ln -s "$SHARED_CLAUDE/$rel" "$target" || return 1
+  done
+}
+
+check_agent_box_cmd() { [ "$(readlink "$BIN_DIR/agent-box" 2>/dev/null)" = "$SCRIPT" ]; }
+install_agent_box_cmd() { mkdir -p "$BIN_DIR" && ln -sfn "$SCRIPT" "$BIN_DIR/agent-box"; }
+
+config_body() {
+  printf 'AGENT_ROLE=%s\nAGENT_HOST=%s\nAGENT_USER=%s\nPASS_VAULT=%s\n' \
+    "$ROLE" "$AGENT_HOST" "$AGENT_USER" "$PASS_VAULT"
+}
+check_config_saved() { [ -f "$CONFIG_FILE" ] && config_body | cmp -s - "$CONFIG_FILE"; }
+install_config_saved() { mkdir -p "$(dirname "$CONFIG_FILE")" && config_body > "$CONFIG_FILE"; }
+
+# ---------------------------------------------------------------- shutdown
+
+# `agent-box off`: asks a Windows/WSL host to shut down. The Windows task
+# "agent-box remote shutdown" polls `_shutdown-pending` every minute.
+request_shutdown() {
+  local target="${1:-$AGENT_HOST}"
+  if [ "$ROLE" = host ] && [ "$target" = "$AGENT_HOST" ]; then
+    mkdir -p "$(dirname "$SHUTDOWN_FLAG")" && touch "$SHUTDOWN_FLAG" || exit 1
+  else
+    ssh -o ConnectTimeout=10 "$target" 'mkdir -p ~/.agent-box && touch ~/.agent-box/shutdown' \
+      || die "couldn't reach $target"
+  fi
+  echo "Shutdown requested for $target; Windows turns off within about 2 minutes."
+}
+
+# Succeeds once for a request made in the last 5 minutes. Old requests are
+# dropped, so a flag left over from before a reboot never shuts the PC down again.
+shutdown_pending() {
+  [ -f "$SHUTDOWN_FLAG" ] || return 1
+  local fresh
+  fresh="$(find "$SHUTDOWN_FLAG" -mmin -5)"
+  rm -f "$SHUTDOWN_FLAG"
+  [ -n "$fresh" ]
+}
 
 # ---------------------------------------------------------------- host
 
@@ -372,12 +486,18 @@ install_herdr_machine() {
 
 # ---------------------------------------------------------------- main
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
+OFF_TARGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    check|install) MODE="$1" ;;
+    check|install|sync) MODE="$1" ;;
+    off) MODE=off; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
+    _shutdown-pending) shutdown_pending; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
+    --host) AGENT_HOST="${2:-}"; shift ;;
+    --user) AGENT_USER="${2:-}"; shift ;;
+    --vault) PASS_VAULT="${2:-}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
@@ -388,14 +508,26 @@ done
 if [ -z "$ROLE" ]; then
   if [ "$PLATFORM" = mac ]; then ROLE=client; else ROLE=host; fi
 fi
+AGENT_HOST="${AGENT_HOST:-pc}"
+PASS_VAULT="${PASS_VAULT:-Agents}"
 case "$ROLE" in host|client) ;; *) die "--role must be host or client" ;; esac
 [ "$ROLE" = host ] && [ "$PLATFORM" = mac ] && die "macOS is supported as a client only"
+
+if [ "$MODE" = off ]; then
+  request_shutdown "$OFF_TARGET"
+  exit 0
+fi
+if [ "$MODE" = sync ]; then
+  git -C "$REPO_DIR" pull --ff-only || die "git pull failed in $REPO_DIR"
+  MODE=install
+fi
 
 printf 'agent-box · %s · role: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$MODE"
 
 section "Base"
 step "curl, git, jq"                      check_base_tools          install_base_tools
 step "~/.local/bin on login-shell PATH"   check_path_in_login_shell install_path_in_login_shell
+step "agent-box command"                  check_agent_box_cmd       install_agent_box_cmd
 
 if [ "$ROLE" = host ]; then
   if [ "$PLATFORM" = wsl ]; then
@@ -424,6 +556,7 @@ section "Agents"
 step "Claude Code"                        check_claude              install_claude
 step "herdr"                              check_herdr               install_herdr
 have herdr && step "herdr ↔ Claude integration" check_herdr_claude install_herdr_claude
+step "shared Claude config (claude/ in this repo)" check_shared_claude install_shared_claude
 if [ "$ROLE" = host ]; then
   step "Claude sandbox deps (bubblewrap, socat)" check_sandbox_deps install_sandbox_deps
   step "herdr panes use login shells"     check_herdr_shell_mode    install_herdr_shell_mode
@@ -437,7 +570,7 @@ section "Secrets (Proton Pass)"
 step "pass-cli"                           check_pass_cli            install_pass_cli
 step "agent token stored"                 check_token               install_token
 step "pp wrapper"                         check_pp                  install_pp
-step "CLAUDE.md secrets instructions"     check_claude_md           install_claude_md
+step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
   step "pp can log in"                    check_pp_works            check_pp_works
 fi
@@ -453,6 +586,9 @@ if [ "$ROLE" = client ]; then
   fi
 fi
 
+section "Settings"
+step "saved to ~/.config/agent-box/config" check_config_saved       install_config_saved
+
 if [ "$ROLE" = client ]; then
   note "Keep Tailscale connected on this machine (it is the only login to $AGENT_HOST)."
 fi
@@ -465,7 +601,7 @@ fi
 printf '\n%d ok · %d installed · %d missing · %d failed\n' "$N_OK" "$N_FIXED" "$N_MISSING" "$N_FAILED"
 if [ -n "$NOTES" ]; then printf '\nManual steps:\n%s' "$NOTES"; fi
 if [ "$MODE" = check ] && [ "$N_MISSING" -gt 0 ]; then
-  printf '\nRun %s./setup.sh install%s to fix missing items.\n' "$C_WARN" "$C_OFF"
+  printf '\nRun %sagent-box install%s (or ./setup.sh install) to fix missing items.\n' "$C_WARN" "$C_OFF"
 fi
 
 [ "$N_MISSING" -eq 0 ] && [ "$N_FAILED" -eq 0 ]

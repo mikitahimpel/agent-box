@@ -1,23 +1,31 @@
-# Checks and installs the Windows side of the agent PC setup.
+# Checks and installs the Windows side of agent-box (Windows host running WSL).
 #
 #   powershell -ExecutionPolicy Bypass -File windows\setup.ps1            check only
 #   powershell -ExecutionPolicy Bypass -File windows\setup.ps1 -Install   install or fix
+#
+# Options: -Distro Ubuntu  -WslMemoryGB <n>  -BackupDir <path>  -BackupKeep <n>
 #
 # Run from an administrator PowerShell. Written for Windows PowerShell 5.1.
 
 param(
     [switch]$Install,
     [string]$Distro = "Ubuntu",
-    [int]$WslMemoryGB = 0
+    [int]$WslMemoryGB = 0,
+    [string]$BackupDir = (Join-Path $env:USERPROFILE "wsl-backups"),
+    [int]$BackupKeep = 3
 )
 
 $ErrorActionPreference = "Stop"
 
-$DataDir      = Join-Path $env:ProgramData "agent-box"
-$WatchdogPath = Join-Path $DataDir "watchdog.ps1"
-$WatchdogTask = "agent-box net watchdog"
+$DataDir       = Join-Path $env:ProgramData "agent-box"
+$WatchdogPath  = Join-Path $DataDir "watchdog.ps1"
+$ShutdownPath  = Join-Path $DataDir "shutdown.ps1"
+$BackupPath    = Join-Path $DataDir "backup.ps1"
+$WatchdogTask  = "agent-box net watchdog"
 $KeepaliveTask = "agent-box WSL keepalive"
-$WslConfig    = Join-Path $env:USERPROFILE ".wslconfig"
+$ShutdownTask  = "agent-box remote shutdown"
+$BackupTask    = "agent-box WSL snapshot"
+$WslConfig     = Join-Path $env:USERPROFILE ".wslconfig"
 
 $script:Counts = @{ ok = 0; installed = 0; missing = 0; failed = 0 }
 $script:Notes = New-Object System.Collections.Generic.List[string]
@@ -129,6 +137,46 @@ if ($wifi) {
 }
 
 Write-Section "Scheduled tasks"
+
+# Tasks that touch WSL must run as you, because WSL distros belong to a user account.
+# They run before anyone logs in, so Windows needs your password once per -Install run.
+$TaskUser = "$env:USERDOMAIN\$env:USERNAME"
+function Get-TaskPassword {
+    if (-not $script:TaskPassword) {
+        Write-Info "Tasks run as $TaskUser before anyone logs in, so Windows needs your password."
+        Write-Info "With a Microsoft account, use its password, not your PIN."
+        $secure = Read-Host "Windows password for $TaskUser" -AsSecureString
+        $script:TaskPassword = (New-Object System.Net.NetworkCredential("", $secure)).Password
+        $script:Notes.Add("If you change your Windows password, delete the 'agent-box' tasks and rerun with -Install.")
+    }
+    $script:TaskPassword
+}
+
+function Test-ManagedScript([string]$Path, [string]$Body) {
+    (Test-Path $Path) -and ((Get-Content $Path -Raw).Trim() -eq $Body.Trim())
+}
+function Write-ManagedScript([string]$Path, [string]$Body) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
+    Set-Content -Path $Path -Value $Body -Encoding UTF8
+}
+function Test-Task([string]$Name) {
+    $null -ne (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)
+}
+function New-ScriptAction([string]$Path) {
+    New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Path`""
+}
+function New-BootAndRepeatTriggers([int]$Minutes) {
+    @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $Minutes))
+    )
+}
+function Register-UserTask([string]$Name, $Action, $Triggers, $Settings) {
+    Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Triggers -Settings $Settings `
+        -User $TaskUser -Password (Get-TaskPassword) -Force | Out-Null
+}
+
 $watchdogBody = @"
 # Managed by agent-box. Resets Wi-Fi when the internet is unreachable.
 if (-not (Test-Connection 1.1.1.1 -Count 2 -Quiet)) {
@@ -138,41 +186,63 @@ if (-not (Test-Connection 1.1.1.1 -Count 2 -Quiet)) {
 "@
 
 Step "Network watchdog task (boot + every 3 min)" {
-    (Test-Path $WatchdogPath) -and
-        ((Get-Content $WatchdogPath -Raw).Trim() -eq $watchdogBody.Trim()) -and
-        (Get-ScheduledTask -TaskName $WatchdogTask -ErrorAction SilentlyContinue)
+    (Test-ManagedScript $WatchdogPath $watchdogBody) -and (Test-Task $WatchdogTask)
 } {
-    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-    Set-Content -Path $WatchdogPath -Value $watchdogBody -Encoding UTF8
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$WatchdogPath`""
-    $triggers = @(
-        (New-ScheduledTaskTrigger -AtStartup),
-        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3))
-    )
-    Register-ScheduledTask -TaskName $WatchdogTask -Action $action -Trigger $triggers `
-        -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+    Write-ManagedScript $WatchdogPath $watchdogBody
+    Register-ScheduledTask -TaskName $WatchdogTask -Action (New-ScriptAction $WatchdogPath) `
+        -Trigger (New-BootAndRepeatTriggers 3) -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 }
 
-Step "WSL keepalive task (boot + every 5 min)" {
-    $null -ne (Get-ScheduledTask -TaskName $KeepaliveTask -ErrorAction SilentlyContinue)
-} {
-    $user = "$env:USERDOMAIN\$env:USERNAME"
-    Write-Info "The task runs as $user before anyone logs in, so Windows needs your password."
-    Write-Info "With a Microsoft account, use its password, not your PIN."
-    $secure = Read-Host "Windows password for $user" -AsSecureString
-    $plain = (New-Object System.Net.NetworkCredential("", $secure)).Password
+Step "WSL keepalive task (boot + every 5 min)" { Test-Task $KeepaliveTask } {
     $action = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $Distro -- sleep infinity"
-    $triggers = @(
-        (New-ScheduledTaskTrigger -AtStartup),
-        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5))
-    )
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName $KeepaliveTask -Action $action -Trigger $triggers `
-        -Settings $settings -User $user -Password $plain -Force | Out-Null
+    Register-UserTask $KeepaliveTask $action (New-BootAndRepeatTriggers 5) $settings
     Start-ScheduledTask -TaskName $KeepaliveTask
-    $script:Notes.Add("If you change your Windows password, rerun with -Install after deleting the '$KeepaliveTask' task.")
+}
+
+# `agent-box off` on any machine creates ~/.agent-box/shutdown inside WSL; this task
+# asks WSL whether a fresh request exists and shuts Windows down if so.
+$shutdownBody = @"
+# Managed by agent-box. Shuts Windows down when 'agent-box off' was run.
+& wsl.exe -d $Distro -- ~/.local/bin/agent-box _shutdown-pending
+if (`$LASTEXITCODE -eq 0) {
+    shutdown.exe /s /t 30 /c "agent-box: shutdown requested"
+}
+"@
+
+Step "Remote shutdown task (every 1 min)" {
+    (Test-ManagedScript $ShutdownPath $shutdownBody) -and (Test-Task $ShutdownTask)
+} {
+    Write-ManagedScript $ShutdownPath $shutdownBody
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+    Register-UserTask $ShutdownTask (New-ScriptAction $ShutdownPath) (New-BootAndRepeatTriggers 1) $settings
+}
+
+$backupBody = @"
+# Managed by agent-box. Exports the WSL distro and keeps the newest $BackupKeep copies.
+`$dir = '$BackupDir'
+New-Item -ItemType Directory -Force -Path `$dir | Out-Null
+`$file = Join-Path `$dir ('$Distro-' + (Get-Date -Format 'yyyy-MM-dd') + '.tar')
+& wsl.exe --export $Distro `$file
+if (`$LASTEXITCODE -ne 0) {
+    Remove-Item `$file -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+Get-ChildItem `$dir -Filter '$Distro-*.tar' | Sort-Object LastWriteTime -Descending |
+    Select-Object -Skip $BackupKeep | Remove-Item -Force
+"@
+
+Step "Weekly WSL snapshot to $BackupDir (keeps $BackupKeep)" {
+    (Test-ManagedScript $BackupPath $backupBody) -and (Test-Task $BackupTask)
+} {
+    Write-ManagedScript $BackupPath $backupBody
+    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+    # StartWhenAvailable runs a missed snapshot at the next boot, since the PC is often off.
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+    Register-UserTask $BackupTask (New-ScriptAction $BackupPath) $trigger $settings
 }
 
 Write-Host ""
