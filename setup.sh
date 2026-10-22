@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Checks and installs the agent PC setup on macOS, Linux and WSL.
+# Checks and installs the agent-box setup on macOS, Linux and WSL.
 #
 #   ./setup.sh               check only, change nothing
 #   ./setup.sh install       install or fix everything that is missing
 #   ./setup.sh install --role host|client
 #
-# Roles: "host" is the machine agents run on (WSL/Linux, reachable as $PC_HOST),
+# Roles: "host" is the machine agents run on (WSL/Linux, reachable as $AGENT_HOST),
 # "client" is the machine you work from (your Mac). Defaults: macOS -> client,
 # WSL/Linux -> host.
 #
 # Settings (environment variables):
-#   PC_HOST     Tailscale name of the host           (default: pc)
-#   PC_USER     Linux user on the host, client only  (asked if missing)
+#   AGENT_HOST  Tailscale name of the host           (default: pc)
+#   AGENT_USER  Linux user on the host, client only  (asked if missing)
 #   PASS_VAULT  Proton Pass vault agents may read    (default: Agents)
 #
 # Written for bash 3.2 so it runs on stock macOS.
 
 set -uo pipefail
 
-PC_HOST="${PC_HOST:-pc}"
-PC_USER="${PC_USER:-}"
+AGENT_HOST="${AGENT_HOST:-pc}"
+AGENT_USER="${AGENT_USER:-}"
 PASS_VAULT="${PASS_VAULT:-Agents}"
 
 TOKEN_SERVICE="proton-pass-agent"
@@ -29,8 +29,8 @@ HERDR_CONFIG="$HOME/.config/herdr/config.toml"
 HERDR_UNIT="$HOME/.config/systemd/user/herdr.service"
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 SSH_CONFIG="$HOME/.ssh/config"
-MARK_START="# >>> agent-pc-setup >>>"
-MARK_END="# <<< agent-pc-setup <<<"
+MARK_START="# >>> agent-box >>>"
+MARK_END="# <<< agent-box <<<"
 
 export PATH="$BIN_DIR:$HOME/.claude/local:$PATH"
 
@@ -188,7 +188,7 @@ pp_script() {
   cat <<EOF
 #!/usr/bin/env bash
 # pp: pass-cli that logs in with the stored agent token when the session has expired.
-# Managed by agent-pc-setup; local edits are overwritten.
+# Managed by agent-box; local edits are overwritten.
 set -euo pipefail
 export PROTON_PASS_SESSION_DIR="\${PROTON_PASS_SESSION_DIR:-\$HOME/.local/state/pass-agent}"
 export PROTON_PASS_AGENT_REASON="\${PROTON_PASS_AGENT_REASON:-agent on \$(hostname)}"
@@ -268,14 +268,14 @@ ts_prefs() { tailscale debug prefs 2>/dev/null || sudo -n tailscale debug prefs 
 
 check_tailscale_up() {
   ts_running || return 1
-  ts_prefs | jq -e --arg h "$PC_HOST" '.RunSSH == true and .Hostname == $h' >/dev/null
+  ts_prefs | jq -e --arg h "$AGENT_HOST" '.RunSSH == true and .Hostname == $h' >/dev/null
 }
 install_tailscale_up() {
   need_tty || return 1
   if ts_running; then
-    sudo tailscale set --ssh --hostname="$PC_HOST"
+    sudo tailscale set --ssh --hostname="$AGENT_HOST"
   else
-    sudo tailscale up --ssh --hostname="$PC_HOST"
+    sudo tailscale up --ssh --hostname="$AGENT_HOST"
   fi
 }
 
@@ -300,7 +300,7 @@ install_herdr_shell_mode() {
 herdr_unit() {
   cat <<EOF
 [Unit]
-Description=Herdr server (agent-pc-setup)
+Description=Herdr server (agent-box)
 
 [Service]
 ExecStart=$(command -v herdr) server
@@ -330,7 +330,7 @@ install_linger() { sudo loginctl enable-linger "$USER"; }
 check_tailscale_client() { have tailscale || [ -d /Applications/Tailscale.app ]; }
 
 ssh_block() {
-  printf 'Host %s\n    HostName %s\n    User %s' "$PC_HOST" "$PC_HOST" "$PC_USER"
+  printf 'Host %s\n    HostName %s\n    User %s' "$AGENT_HOST" "$AGENT_HOST" "$AGENT_USER"
 }
 current_ssh_user() {
   awk -v s="$MARK_START" -v e="$MARK_END" '
@@ -340,34 +340,34 @@ current_ssh_user() {
   ' "$SSH_CONFIG" 2>/dev/null
 }
 check_ssh_config() {
-  [ -n "$PC_USER" ] || PC_USER="$(current_ssh_user)"
-  [ -n "$PC_USER" ] && block_matches "$SSH_CONFIG" "$(ssh_block)"
+  [ -n "$AGENT_USER" ] || AGENT_USER="$(current_ssh_user)"
+  [ -n "$AGENT_USER" ] && block_matches "$SSH_CONFIG" "$(ssh_block)"
 }
 install_ssh_config() {
-  if [ -z "$PC_USER" ]; then
-    need_tty || { info "set PC_USER=<linux user on $PC_HOST>"; return 1; }
-    printf '    Linux user on %s: ' "$PC_HOST"
-    read -r PC_USER
-    [ -n "$PC_USER" ] || return 1
+  if [ -z "$AGENT_USER" ]; then
+    need_tty || { info "set AGENT_USER=<linux user on $AGENT_HOST>"; return 1; }
+    printf '    Linux user on %s: ' "$AGENT_HOST"
+    read -r AGENT_USER
+    [ -n "$AGENT_USER" ] || return 1
   fi
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   replace_block "$SSH_CONFIG" "$(ssh_block)"
   chmod 600 "$SSH_CONFIG"
 }
 
-check_ssh_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$PC_HOST" true </dev/null >/dev/null 2>&1; }
+check_ssh_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$AGENT_HOST" true </dev/null >/dev/null 2>&1; }
 install_ssh_reachable() {
-  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$PC_HOST" true </dev/null \
-    || { info "is $PC_HOST turned on and online in Tailscale?"; return 1; }
+  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$AGENT_HOST" true </dev/null \
+    || { info "is $AGENT_HOST turned on and online in Tailscale?"; return 1; }
 }
 
 check_herdr_machine() {
   herdr machine list --json 2>/dev/null \
-    | jq -e --arg l "$PC_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
+    | jq -e --arg l "$AGENT_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
 }
 install_herdr_machine() {
   need_tty || return 1
-  herdr machine add "$PC_HOST" --label "$PC_HOST"
+  herdr machine add "$AGENT_HOST" --label "$AGENT_HOST"
 }
 
 # ---------------------------------------------------------------- main
@@ -391,7 +391,7 @@ fi
 case "$ROLE" in host|client) ;; *) die "--role must be host or client" ;; esac
 [ "$ROLE" = host ] && [ "$PLATFORM" = mac ] && die "macOS is supported as a client only"
 
-printf 'agent-pc-setup · %s · role: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$MODE"
+printf 'agent-box · %s · role: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$MODE"
 
 section "Base"
 step "curl, git, jq"                      check_base_tools          install_base_tools
@@ -409,7 +409,7 @@ if [ "$ROLE" = host ]; then
   step "Tailscale installed"              check_tailscale           install_tailscale
   if [ "$SYSTEMD" = 1 ]; then
     step "tailscaled enabled at boot"     check_tailscaled          install_tailscaled
-    step "Tailscale up as '$PC_HOST' with Tailscale SSH" check_tailscale_up install_tailscale_up
+    step "Tailscale up as '$AGENT_HOST' with Tailscale SSH" check_tailscale_up install_tailscale_up
   else
     info "skipping Tailscale service steps until systemd runs"
   fi
@@ -443,21 +443,21 @@ if have pass-cli && check_token && check_pp; then
 fi
 
 if [ "$ROLE" = client ]; then
-  section "Connection to $PC_HOST"
-  step "SSH config for '$PC_HOST'"        check_ssh_config          install_ssh_config
+  section "Connection to $AGENT_HOST"
+  step "SSH config for '$AGENT_HOST'"        check_ssh_config          install_ssh_config
   if check_ssh_config; then
-    step "$PC_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
+    step "$AGENT_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
   fi
   if have herdr && check_ssh_reachable; then
-    step "herdr machine '$PC_HOST' saved" check_herdr_machine       install_herdr_machine
+    step "herdr machine '$AGENT_HOST' saved" check_herdr_machine       install_herdr_machine
   fi
 fi
 
 if [ "$ROLE" = client ]; then
-  note "Keep Tailscale connected on this machine (it is the only login to $PC_HOST)."
+  note "Keep Tailscale connected on this machine (it is the only login to $AGENT_HOST)."
 fi
 if [ "$ROLE" = host ]; then
-  note "Tailscale admin console: disable key expiry for '$PC_HOST'."
+  note "Tailscale admin console: disable key expiry for '$AGENT_HOST'."
   note "Tailscale admin console → Access controls: SSH rule action \"accept\" (see README)."
   note "Inside WSL, log in once: 'claude', and 'gh auth login' if agents push to GitHub."
 fi

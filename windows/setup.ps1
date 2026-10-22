@@ -13,10 +13,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$DataDir      = Join-Path $env:ProgramData "agent-pc-setup"
+$DataDir      = Join-Path $env:ProgramData "agent-box"
 $WatchdogPath = Join-Path $DataDir "watchdog.ps1"
-$WatchdogTask = "agent-pc net watchdog"
-$KeepaliveTask = "agent-pc WSL keepalive"
+$WatchdogTask = "agent-box net watchdog"
+$KeepaliveTask = "agent-box WSL keepalive"
 $WslConfig    = Join-Path $env:USERPROFILE ".wslconfig"
 
 $script:Counts = @{ ok = 0; installed = 0; missing = 0; failed = 0 }
@@ -78,7 +78,7 @@ if (-not (Test-Admin)) {
 
 $mode = "check"
 if ($Install) { $mode = "install" }
-Write-Host "agent-pc-setup - windows - mode: $mode"
+Write-Host "agent-box - windows - mode: $mode"
 
 Write-Section "Hardware and WSL"
 Step "CPU virtualization (SVM) enabled" {
@@ -130,7 +130,7 @@ if ($wifi) {
 
 Write-Section "Scheduled tasks"
 $watchdogBody = @"
-# Managed by agent-pc-setup. Resets Wi-Fi when the internet is unreachable.
+# Managed by agent-box. Resets Wi-Fi when the internet is unreachable.
 if (-not (Test-Connection 1.1.1.1 -Count 2 -Quiet)) {
     Get-NetAdapter -Physical | Where-Object { `$_.PhysicalMediaType -match '802\.11' } |
         Restart-NetAdapter -Confirm:`$false

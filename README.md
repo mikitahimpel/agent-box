@@ -1,8 +1,8 @@
-# agent-pc-setup
+# agent-box
 
-Turn a Windows gaming PC into a remote Linux box for coding agents.
+Set up machines for running coding agents remotely with [herdr](https://herdr.dev), Tailscale and Proton Pass. Every machine is either a **host** (agents run there: Linux, or WSL on Windows) or a **client** (you work from it: macOS or Linux). `setup.sh` checks and installs both roles.
 
-You press the PC's power button. About a minute later, **pc** comes online in [herdr](https://herdr.dev) on your Mac. You open panes there and run Claude Code in WSL Ubuntu. Nothing else needs touching: no Windows login, no monitor, no SSH keys. The same PC stays a normal Windows gaming machine.
+The reference setup is a Windows gaming PC as the host and a Mac as the client. You press the PC's power button. About a minute later, **pc** comes online in [herdr](https://herdr.dev) on your Mac. You open panes there and run Claude Code in WSL Ubuntu. Nothing else needs touching: no Windows login, no monitor, no SSH keys. The same PC stays a normal Windows gaming machine.
 
 ```
 Mac: herdr (Local + "pc") ──ssh over Tailscale──▶ pc = WSL Ubuntu
@@ -27,7 +27,7 @@ Both scripts only check by default and report what's missing. Add `install` (or 
 ./setup.sh install --role client # force a role (default: macOS = client, WSL/Linux = host)
 ```
 
-Settings come from environment variables: `PC_HOST` (default `pc`), `PC_USER` (Linux user on the host, asked if missing), `PASS_VAULT` (default `Agents`).
+Settings come from environment variables: `AGENT_HOST` (default `pc`), `AGENT_USER` (Linux user on the host, asked if missing), `PASS_VAULT` (default `Agents`).
 
 ## Setup order
 
@@ -43,8 +43,8 @@ The repo is private, so get it with the GitHub CLI. In an administrator PowerShe
 ```powershell
 winget install --id GitHub.cli
 gh auth login
-gh repo clone mikitahimpel/agent-pc-setup $env:USERPROFILE\agent-pc-setup
-powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\agent-pc-setup\windows\setup.ps1 -Install
+gh repo clone mikitahimpel/agent-box $env:USERPROFILE\agent-box
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\agent-box\windows\setup.ps1 -Install
 ```
 This sets:
 - sleep on AC power to never
@@ -64,8 +64,8 @@ Also check these by hand:
 ```bash
 sudo apt update && sudo apt install -y gh
 gh auth login
-gh repo clone mikitahimpel/agent-pc-setup ~/agent-pc-setup
-cd ~/agent-pc-setup
+gh repo clone mikitahimpel/agent-box ~/agent-box
+cd ~/agent-box
 ./setup.sh install
 ```
 `gh auth login` also covers the GitHub login agents need later.
@@ -138,4 +138,4 @@ If it doesn't come online:
 
 - The Windows script is written for Windows PowerShell 5.1 but hasn't been run on a real machine yet. Read its check output before trusting it.
 - `pp` assumes `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
-- If you change your Windows password, delete the `agent-pc WSL keepalive` task and rerun `windows\setup.ps1 -Install`.
+- If you change your Windows password, delete the `agent-box WSL keepalive` task and rerun `windows\setup.ps1 -Install`.
