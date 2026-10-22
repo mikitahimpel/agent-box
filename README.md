@@ -39,9 +39,12 @@ Gigabyte AORUS AM4:
 - CSM disabled (UEFI only), so nothing waits for a key press
 
 ### 2. Windows
-In an administrator PowerShell, from a copy of this repo:
+The repo is private, so get it with the GitHub CLI. In an administrator PowerShell:
 ```powershell
-powershell -ExecutionPolicy Bypass -File windows\setup.ps1 -Install
+winget install --id GitHub.cli
+gh auth login
+gh repo clone mikitahimpel/agent-pc-setup $env:USERPROFILE\agent-pc-setup
+powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\agent-pc-setup\windows\setup.ps1 -Install
 ```
 This sets:
 - sleep on AC power to never
@@ -59,17 +62,20 @@ Also check these by hand:
 
 ### 3. WSL Ubuntu (the host)
 ```bash
-git clone https://github.com/<you>/agent-pc-setup.git ~/agent-pc-setup
+sudo apt update && sudo apt install -y gh
+gh auth login
+gh repo clone mikitahimpel/agent-pc-setup ~/agent-pc-setup
 cd ~/agent-pc-setup
 ./setup.sh install
 ```
+`gh auth login` also covers the GitHub login agents need later.
 The first run writes `/etc/wsl.conf` (systemd on, Windows drives hidden from agents) and asks you to run `wsl --shutdown` in PowerShell. Reopen Ubuntu and run `./setup.sh install` again to finish:
 - Tailscale with **Tailscale SSH**, named `pc` (opens a login link the first time)
 - herdr, plus its server as a systemd user service with linger, so it runs without a login
 - Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
 - Proton Pass CLI, the agent token (asked once), the `pp` wrapper and the secrets section in `~/.claude/CLAUDE.md`
 
-Then log in once inside WSL: run `claude`, and `gh auth login` if agents will push to GitHub.
+Then log in to Claude once inside WSL by running `claude`.
 
 ### 4. Tailscale admin console (once)
 - **Machines → pc → Disable key expiry**
