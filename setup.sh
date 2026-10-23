@@ -11,8 +11,10 @@
 #
 # Options (install saves them to ~/.config/agent-box/config for later runs):
 #   --role host|client      default: macOS -> client, WSL/Linux -> host
-#   --host NAME             on a host: its Tailscale name (default: pc)
-#   --host [USER@]NAME,...  on a client: the hosts to connect to (default: pc)
+#   --host NAME             on a host: its Tailscale name (default: the current one,
+#                           else asked)
+#   --host [USER@]NAME,...  on a client: the hosts to connect to (default: hosts found
+#                           on Tailscale that run agent-box, plus earlier ones)
 #   --user NAME             Linux user for client hosts given without USER@ (asked if missing)
 #   --vault NAME            Proton Pass vault agents may read (default: Agents)
 #   --autonomous on|off     Claude works without prompts inside its sandbox (default: off)
@@ -526,6 +528,15 @@ install_tailscaled() { sudo systemctl enable --now tailscaled; }
 ts_running() { [ "$(tailscale status --json 2>/dev/null | jq -r .BackendState)" = Running ]; }
 ts_prefs() { tailscale debug prefs 2>/dev/null || sudo -n tailscale debug prefs 2>/dev/null; }
 
+# The name this machine already has on the tailnet, if it's logged in.
+current_ts_name() {
+  have tailscale || return 0
+  local n
+  n="$(ts_prefs | jq -r '.Hostname // empty' 2>/dev/null)"
+  [ -n "$n" ] || n="$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | cut -d. -f1)"
+  echo "$n"
+}
+
 check_tailscale_up() {
   ts_running || return 1
   ts_prefs | jq -e --arg h "$AGENT_HOST" '.RunSSH == true and .Hostname == $h' >/dev/null
@@ -593,6 +604,63 @@ check_tailscale_client() { have tailscale || [ -d /Applications/Tailscale.app ];
 host_name() { echo "${1#*@}"; }
 host_user() { case "$1" in *@*) echo "${1%@*}" ;; esac; }
 host_names() { local h; for h in $AGENT_HOSTS; do host_name "$h"; done; }
+
+# The Mac App Store build of Tailscale has no CLI on PATH.
+ts() {
+  if have tailscale; then tailscale "$@"
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale "$@"
+  else return 1; fi
+}
+
+# with_timeout <seconds> <cmd...>: a Tailscale SSH "check" rule would otherwise
+# wait for a browser login forever.
+with_timeout() {
+  local secs="$1" pid watcher rc
+  shift
+  "$@" & pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) & watcher=$!
+  wait "$pid"; rc=$?
+  kill "$watcher" 2>/dev/null
+  return $rc
+}
+
+# Online Linux peers with Tailscale SSH on: possible hosts.
+tailnet_ssh_peers() {
+  ts status --json 2>/dev/null | jq -r '
+    .Peer[]? | select(.OS == "linux" and .Online and ((.sshHostKeys // []) | length > 0))
+    | .DNSName | split(".")[0]'
+}
+# Users worth trying on a new host: those of known hosts and ~/.ssh/config, then ours.
+candidate_users() {
+  {
+    for h in $AGENT_HOSTS; do host_user "$h"; done
+    awk 'tolower($1) == "user" { print $2 }' "$SSH_CONFIG" 2>/dev/null
+    echo "$USER"
+  } | awk 'NF && !seen[$0]++'
+}
+# probe_host <name>: prints user@name if a candidate user can log in and the
+# machine has agent-box installed.
+probe_host() {
+  local u rc
+  for u in $(candidate_users); do
+    with_timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      "$u@$1" 'test -e ~/.local/bin/agent-box' </dev/null >/dev/null 2>&1
+    rc=$?
+    [ "$rc" = 0 ] && { echo "$u@$1"; return 0; }
+    [ "$rc" = 255 ] || return 1
+  done
+  return 1
+}
+# Prints user@name for agent-box hosts on the tailnet that aren't in AGENT_HOSTS yet.
+discover_hosts() {
+  local n known
+  known=" $(host_names | tr '\n' ' ') "
+  for n in $(tailnet_ssh_peers); do
+    case "$known" in *" $n "*) continue ;; esac
+    probe_host "$n"
+  done
+}
 
 ssh_block() {
   local h n sep=""
@@ -663,8 +731,7 @@ add_host() {
     COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$(dirname "$REPO_DIR")" -czf - "$base"
   else
     tar -C "$(dirname "$REPO_DIR")" -czf - "$base"
-  fi | ssh "$@" "$addr" "tar -xzf - -C ~ 2>/dev/null; test -d ~/$base/.git &&
-    sed -i 's#url = https://github.com/#url = git@github.com:#' ~/$base/.git/config" \
+  fi | ssh "$@" "$addr" "tar -xzf - -C ~ 2>/dev/null; test -d ~/$base/.git" \
     || die "copying to $addr failed"
 
   echo "Setting up $addr as host '$name'"
@@ -711,11 +778,21 @@ fi
 if [ "$MODE" = add ]; then ADD_NAME="$HOST_ARG"; HOST_ARG=""; fi
 if [ "$ROLE" = host ]; then
   [ -n "$HOST_ARG" ] && AGENT_HOST="$(host_name "$HOST_ARG")"
-  AGENT_HOST="${AGENT_HOST:-pc}"
+  [ -n "$AGENT_HOST" ] || AGENT_HOST="$(current_ts_name)"
+  if [ -z "$AGENT_HOST" ]; then
+    _default="$(hostname -s | tr '[:upper:]' '[:lower:]')"
+    case "$MODE" in install|sync)
+      if [ -t 0 ]; then
+        printf 'Name for this machine (your other machines reach it by this name) [%s]: ' "$_default"
+        read -r AGENT_HOST
+      fi ;;
+    esac
+    AGENT_HOST="${AGENT_HOST:-$_default}"
+  fi
 else
   [ -n "$HOST_ARG" ] && AGENT_HOSTS="$(printf '%s' "$HOST_ARG" | tr ',' ' ')"
   # Older configs saved a single AGENT_HOST and AGENT_USER.
-  [ -n "$AGENT_HOSTS" ] || AGENT_HOSTS="${AGENT_HOST:-pc}"
+  [ -n "$AGENT_HOSTS" ] || AGENT_HOSTS="$AGENT_HOST"
   if [ -n "$AGENT_USER" ]; then
     _hosts=""
     for _h in $AGENT_HOSTS; do
@@ -747,7 +824,6 @@ if [ "$MODE" = sync ]; then
 fi
 
 printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
-if [ "$ROLE" = client ]; then printf 'hosts: %s\n' "$AGENT_HOSTS"; fi
 
 section "Base"
 step "curl, git, jq"                      check_base_tools          install_base_tools
@@ -816,9 +892,19 @@ if have pass-cli && check_token && check_pp; then
 fi
 
 if [ "$ROLE" = client ]; then
-  section "Connection to hosts"
-  step "SSH config for $(host_names | paste -sd, - | sed 's/,/, /g')" check_ssh_config install_ssh_config
-  if check_ssh_config; then
+  section "Hosts"
+  if [ -z "$HOST_ARG" ]; then
+    for _h in $(discover_hosts); do
+      info "found $_h on Tailscale"
+      AGENT_HOSTS="${AGENT_HOSTS:+$AGENT_HOSTS }$_h"
+    done
+  fi
+  if [ -z "$AGENT_HOSTS" ]; then
+    info "no hosts yet: set one up (the one-line install on it), then rerun here"
+  else
+    step "SSH config for $(host_names | paste -sd, - | sed 's/,/, /g')" check_ssh_config install_ssh_config
+  fi
+  if [ -n "$AGENT_HOSTS" ] && check_ssh_config; then
     for CUR_HOST in $(host_names); do
       step "$CUR_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
       if have herdr && check_ssh_reachable; then

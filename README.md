@@ -20,73 +20,95 @@ Windows host: games · WSL keepalive · Wi-Fi watchdog · remote shutdown · wee
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks. |
 | `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
 
-Both scripts only check by default and report what's missing. Add `install` (or `-Install` on Windows) to apply changes.
+## Install
 
+One command per machine, the same command every time: to set up, to fix, to update. It downloads agent-box, works out what the machine is, and asks only for what it can't find out (logins, tokens, a name).
+
+**macOS, Linux, WSL, Raspberry Pi:**
 ```bash
-agent-box                  # check (before the first install: ./setup.sh)
-agent-box install          # fix
-agent-box sync             # git pull this repo, then install
-agent-box off [host]       # shut a host down remotely
-agent-box add user@address # turn a Linux machine on your network into a host (from the Mac)
+curl -fsSL https://raw.githubusercontent.com/mikitahimpel/agent-box/main/install.sh | bash
 ```
+
+**Windows** (administrator PowerShell). Sets up Windows, then runs the line above inside WSL:
+```powershell
+irm https://raw.githubusercontent.com/mikitahimpel/agent-box/main/install.ps1 | iex
+```
+
+Then:
+- Run `claude` once on each machine to log in.
+- **Tailscale admin console:** disable key expiry for each host, and set the SSH rule once (see [Tailscale](#tailscale-admin-console-once)).
+- On the Mac: run the same command again after setting up a new host. It finds the host on Tailscale and adds it to herdr.
+
+What it decides for you:
+
+| Question | Answer |
+|---|---|
+| Host or client? | macOS is a client. Linux and WSL are hosts. |
+| The host's name | Its current Tailscale name. On a fresh machine, it asks once and suggests the hostname. |
+| Which hosts a client connects to | Online Linux machines on your Tailscale with Tailscale SSH and agent-box installed. Logins are tried with the users your other hosts and `~/.ssh/config` use, then yours. |
+
+Afterwards the machine has the `agent-box` command:
+```bash
+agent-box                  # check what's missing (changes nothing)
+agent-box install          # fix
+agent-box sync             # update agent-box, then install (what the one-liner does)
+agent-box off [host]       # shut a host down remotely
+agent-box add user@address # set up a Linux machine on your network from the Mac, over plain SSH
+```
+
+Options override what it decides. `install` saves them to `~/.config/agent-box/config`, so you only pass them once:
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--role host\|client` | macOS = client, WSL/Linux = host | Which role this machine plays |
-| `--host NAME` | `pc` | On a host: its Tailscale name |
-| `--host USER@NAME,...` | `pc` | On a client: every host to connect to, e.g. `gimpel@pc,pi@pi` |
-| `--user NAME` | asked | On a client: Linux user for hosts listed without `USER@` |
+| `--host NAME` | current Tailscale name, else asked | On a host: its Tailscale name |
+| `--host USER@NAME,...` | found on Tailscale | On a client: exactly these hosts, e.g. `gimpel@pc,pi@pi` |
+| `--user NAME` | tried automatically | On a client: Linux user for hosts listed without `USER@` |
 | `--vault NAME` | `Agents` | Proton Pass vault agents may read |
 | `--autonomous on\|off` | `off` | Claude works without permission prompts inside its sandbox (see below) |
 
-`install` saves the options to `~/.config/agent-box/config`, so later runs need no flags. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_HOSTS`, `AGENT_USER` and `PASS_VAULT` work too.
+Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -- --autonomous on`. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_HOSTS`, `AGENT_USER` and `PASS_VAULT` work too.
 
-## Setup order
+## What's in this repo
 
-### 1. BIOS (once, by hand)
+| File | Runs on | Does |
+|---|---|---|
+| `install.sh`, `install.ps1` | everywhere / Windows | The one-line installers above |
+| `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
+| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks |
+| `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
+
+## The Windows PC in detail
+
+### BIOS (once, by hand)
 Gigabyte AORUS AM4:
 - **Boot → Boot Option #1:** the Windows drive
 - **Boot → Fast Boot:** Enabled (not "Ultra Fast")
 - **Tweaker → Advanced CPU Settings → SVM Mode:** Enabled
 - CSM disabled (UEFI only), so nothing waits for a key press
 
-### 2. Windows
-The repo is private, so get it with the GitHub CLI. In an administrator PowerShell:
-```powershell
-winget install --id GitHub.cli
-gh auth login
-gh repo clone mikitahimpel/agent-box $env:USERPROFILE\agent-box
-powershell -ExecutionPolicy Bypass -File $env:USERPROFILE\agent-box\windows\setup.ps1 -Install
-```
-This sets:
+### What the Windows installer does
+`install.ps1` downloads agent-box to `%USERPROFILE%\agent-box` and runs `windows\setup.ps1 -Install`, which sets:
 - sleep on AC power to never
 - Wi-Fi adapter never powered off to save power
 - WSL memory capped at half your RAM
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
 - a **remote shutdown** task that turns Windows off after `agent-box off` (checks every minute)
-- a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. Change it with `-BackupDir D:\wsl-backups -BackupKeep 5`.
+- a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. To change it, run `windows\setup.ps1 -Install -BackupDir D:\wsl-backups -BackupKeep 5`.
 
-The tasks that touch WSL run as your Windows user before anyone logs in, so the script asks for your Windows password once.
+The tasks that touch WSL run as your Windows user before anyone logs in, so it asks for your Windows password once.
 
-If WSL isn't installed yet, it installs Ubuntu. Reboot, open Ubuntu once to create your Linux user, then rerun the script.
+If WSL isn't installed yet, it installs Ubuntu and stops. Reboot, open Ubuntu once to create your Linux user, then run the same command again. It then runs the Linux install inside WSL, restarting WSL once on the way to turn on systemd.
 
 Also check these by hand:
 - **BitLocker / Device Encryption:** TPM-only, no PIN.
 - **Fast Startup:** fine to leave on; the repeating tasks cover the cases where it skips startup triggers.
-- **Windows Tailscale:** not needed. If it's installed with the name `pc`, rename or remove it so it doesn't clash with WSL.
+- **Windows Tailscale:** not needed. If it's installed under the same name as WSL, rename or remove it so they don't clash.
 
-### 3. WSL Ubuntu (the host)
-```bash
-sudo apt update && sudo apt install -y gh
-gh auth login
-gh repo clone mikitahimpel/agent-box ~/agent-box
-cd ~/agent-box
-./setup.sh install
-```
-This first `gh auth login` is only to clone the private repo. `setup.sh` takes GitHub access from there (see [GitHub](#github)).
-The first run writes `/etc/wsl.conf` (systemd on, Windows drives hidden from agents) and asks you to run `wsl --shutdown` in PowerShell. Reopen Ubuntu and run `./setup.sh install` again to finish:
-- Tailscale with **Tailscale SSH**, named `pc` (opens a login link the first time)
+### What the Linux install does on a host
+- `/etc/wsl.conf` on WSL: systemd on, Windows drives hidden from agents
+- Tailscale with **Tailscale SSH** (opens a login link the first time)
 - herdr, plus its server as a systemd user service with linger, so it runs without a login
 - Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
@@ -94,10 +116,10 @@ The first run writes `/etc/wsl.conf` (systemd on, Windows drives hidden from age
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
-Then log in to Claude once inside WSL by running `claude`.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` and a herdr machine per host. A host must be on for the Mac to add it.
 
-### 4. Tailscale admin console (once)
-- **Machines → pc → Disable key expiry**
+## Tailscale admin console (once)
+- **Machines → each host → Disable key expiry**
 - **Access controls:** make Tailscale SSH accept logins without browser re-checks. herdr reconnects in the background, so `check` mode would break it:
   ```json
   "ssh": [
@@ -106,26 +128,15 @@ Then log in to Claude once inside WSL by running `claude`.
   ```
 - **DNS → MagicDNS:** on (it is by default)
 
-### 5. Mac (the client)
-```bash
-./setup.sh install
-```
-Use `./setup.sh install --host <linux user>@pc` the first time (add more hosts comma-separated, see [Raspberry Pi](#raspberry-pi-or-another-linux-host)). For each host this adds a `Host` entry to `~/.ssh/config`, accepts its host key and saves it as a herdr machine. It also sets up the same Proton Pass agent access as the host. A host must be on for its last two steps.
-
 ## Raspberry Pi (or another Linux host)
 
-Any Linux machine can be a second host that works exactly like `pc`: Tailscale SSH, herdr server at boot, Claude Code, `gh` and Proton Pass. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and herdr have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
+Any Linux machine can be a host that works exactly like the PC. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and herdr have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
 
-Turn SSH on for the Pi (Raspberry Pi Imager → *Enable SSH*, or `sudo raspi-config` → Interface Options → SSH). Then, from the Mac:
+Run the one-line install on it. Or, if you'd rather not touch the Pi, turn SSH on (Raspberry Pi Imager → *Enable SSH*, or `sudo raspi-config` → Interface Options → SSH) and run from the Mac:
 ```bash
 agent-box add pi@raspberrypi.local --host pi
 ```
-Use your Pi's user and address. It asks for the Pi's password once, then:
-1. copies this repo to `~/agent-box` on the Pi (with the git remote switched to SSH, so `agent-box sync` works there)
-2. runs `setup.sh install --role host --host pi` on the Pi, in your terminal: same prompts as on the PC (Tailscale login link, GitHub login, Proton Pass token)
-3. adds `pi` to the Mac's hosts and runs the client install, so `pi` shows up in herdr next to `pc`
-
-Without `--host`, the host is named after the Pi's hostname. Afterwards, log in to Claude once in a `pi` pane (`claude`), and disable key expiry for `pi` in the Tailscale admin console. The SSH `accept` rule from step 4 already covers it. Create a separate Proton Pass agent token for the Pi.
+That asks for the Pi's password once, copies agent-box there, runs the host install in your terminal, then adds the Pi on the Mac. Without `--host`, the name comes from the Pi's hostname.
 
 `agent-box off pi` powers it off directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
 
@@ -168,7 +179,7 @@ The keys have no passphrase so agents can push with nobody at the keyboard. They
 Agents read secrets from one Proton Pass vault (`Agents` by default) through a **scoped agent token**. Each token can only see the vaults you pick, is read-only by default, and logs every read with a reason.
 
 1. In **pass.proton.me → Settings → Access tokens → New token**, create one token per machine (`pc`, `mac`): expiry 1 year, vault `Agents`, **Use for AI agent** on.
-2. `./setup.sh install` asks for the token once. On macOS it goes in the Keychain; on Linux/WSL in `~/.config/pass-agent/token` (mode 600).
+2. The install asks for the token once. On macOS it goes in the Keychain; on Linux/WSL in `~/.config/pass-agent/token` (mode 600).
 3. `pp` wraps `pass-cli`. Agent sessions last 2 hours, and `pp` logs back in with the stored token whenever the session has expired.
 
 Agents use it like this (the `~/.claude/CLAUDE.md` block tells them to):
@@ -181,7 +192,7 @@ pp run --env-file .env -- npm test
 
 Check what agents read with `pass-cli agent monitor <token-name>` (logged in as yourself) or under **Manage vault access** in the web app.
 
-**Yearly:** create new tokens before they expire. Delete the stored token (`security delete-generic-password -s proton-pass-agent` on macOS, `rm ~/.config/pass-agent/token` on Linux) and rerun `./setup.sh install`.
+**Yearly:** create new tokens before they expire. Delete the stored token (`security delete-generic-password -s proton-pass-agent` on macOS, `rm ~/.config/pass-agent/token` on Linux) and rerun `agent-box install`.
 
 **Note:** anything running as your user, agents included, can read the stored token. Only put in the vault what you're fine with an agent seeing.
 
@@ -200,13 +211,14 @@ Repeat 5–10 times: shut the PC down, press the power button, don't touch it. I
 
 If it doesn't come online:
 1. Is the `WSL keepalive` task running? (Task Scheduler on Windows)
-2. Inside WSL: `./setup.sh` (check mode) and `systemctl --user status herdr`
+2. Inside WSL: `agent-box` (check mode) and `systemctl --user status herdr`
 3. On the Mac: `herdr machine status pc` and `ssh pc true`
 
 ## Known limits
 
-- The Windows script is written for Windows PowerShell 5.1 but hasn't been run on a real machine yet. Read its check output before trusting it.
+- `install.ps1` and `windows/setup.ps1` are written for Windows PowerShell 5.1 but haven't been run on a real machine yet. Read their output before trusting them.
+- Host discovery logs in to each new Linux peer with Tailscale SSH to look for agent-box. A peer whose user isn't among the tried ones is skipped; add it with `--host user@name`.
 - `pp` assumes `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
-- If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and rerun `windows\setup.ps1 -Install`.
+- If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and run the Windows one-liner again.
 - `wsl --export` of a running distro and the shutdown task's call into WSL are untested on a real PC. Check Task Scheduler's "Last Run Result" after the first week.
 - Snapshots are full copies of Ubuntu and can be large. Point `-BackupDir` at a drive with room.
