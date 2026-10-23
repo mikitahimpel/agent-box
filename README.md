@@ -1,6 +1,6 @@
 # agent-box
 
-Set up machines for running coding agents remotely with [herdr](https://herdr.dev), Tailscale and Proton Pass. Every machine is either a **host** (agents run there: Linux, or WSL on Windows) or a **client** (you work from it: macOS or Linux). `setup.sh` checks and installs both roles.
+Set up machines for running coding agents remotely with [herdr](https://herdr.dev), Tailscale and Proton Pass. Every machine is either a **host** (agents run there: Linux including a Raspberry Pi, or WSL on Windows) or a **client** (you work from it: macOS or Linux). `setup.sh` checks and installs both roles.
 
 The reference setup is a Windows gaming PC as the host and a Mac as the client. You press the PC's power button. About a minute later, **pc** comes online in [herdr](https://herdr.dev) on your Mac. You open panes there and run Claude Code in WSL Ubuntu. Nothing else needs touching: no Windows login, no monitor, no SSH keys. The same PC stays a normal Windows gaming machine.
 
@@ -26,18 +26,19 @@ Both scripts only check by default and report what's missing. Add `install` (or 
 agent-box                  # check (before the first install: ./setup.sh)
 agent-box install          # fix
 agent-box sync             # git pull this repo, then install
-agent-box off [host]       # shut a Windows/WSL host down remotely
+agent-box off [host]       # shut a host down remotely
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--role host\|client` | macOS = client, WSL/Linux = host | Which role this machine plays |
-| `--host NAME` | `pc` | Tailscale name of the host |
-| `--user NAME` | asked | Linux user on the host (clients only) |
+| `--host NAME` | `pc` | On a host: its Tailscale name |
+| `--host USER@NAME,...` | `pc` | On a client: every host to connect to, e.g. `gimpel@pc,pi@pi` |
+| `--user NAME` | asked | On a client: Linux user for hosts listed without `USER@` |
 | `--vault NAME` | `Agents` | Proton Pass vault agents may read |
 | `--autonomous on\|off` | `off` | Claude works without permission prompts inside its sandbox (see below) |
 
-`install` saves the options to `~/.config/agent-box/config`, so later runs need no flags. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_USER` and `PASS_VAULT` work too.
+`install` saves the options to `~/.config/agent-box/config`, so later runs need no flags. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_HOSTS`, `AGENT_USER` and `PASS_VAULT` work too.
 
 ## Setup order
 
@@ -108,7 +109,26 @@ Then log in to Claude once inside WSL by running `claude`.
 ```bash
 ./setup.sh install
 ```
-Use `./setup.sh install --user <linux user on pc>` the first time. This adds `Host pc` to `~/.ssh/config`, accepts the PC's host key, saves `pc` as a herdr machine, and sets up the same Proton Pass agent access as the host. The PC must be on for the last two steps.
+Use `./setup.sh install --host <linux user>@pc` the first time (add more hosts comma-separated, see [Raspberry Pi](#raspberry-pi-or-another-linux-host)). For each host this adds a `Host` entry to `~/.ssh/config`, accepts its host key and saves it as a herdr machine. It also sets up the same Proton Pass agent access as the host. A host must be on for its last two steps.
+
+## Raspberry Pi (or another Linux host)
+
+Any Linux machine can be a second host that works exactly like `pc`: Tailscale SSH, herdr server at boot, Claude Code, `gh` and Proton Pass. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and herdr have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
+
+On the Pi:
+```bash
+sudo apt update && sudo apt install -y git gh
+gh auth login
+gh repo clone mikitahimpel/agent-box ~/agent-box
+~/agent-box/setup.sh install --host pi
+```
+Then `claude` once to log in, and in the Tailscale admin console disable key expiry for `pi`. The SSH `accept` rule from step 4 already covers it. Create a separate Proton Pass agent token for the Pi.
+
+On the Mac, list both hosts:
+```bash
+agent-box install --host gimpel@pc,pi@pi
+```
+`pi` then shows up in herdr next to `pc`. `agent-box off pi` powers it off directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
 
 ## Daily use
 
@@ -116,7 +136,7 @@ Use `./setup.sh install --user <linux user on pc>` the first time. This adds `Ho
 |---|---|
 | Start | Press the power button. **pc** comes online in herdr in about 1–2 min. |
 | Work | Open panes under **pc** in herdr on the Mac. Agents keep running when the Mac closes. |
-| Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. |
+| Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. `agent-box off pi` for the Pi. |
 | Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
 | Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
 | Game | Just play. `wsl --shutdown` first if you want the RAM back. |

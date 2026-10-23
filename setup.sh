@@ -4,18 +4,19 @@
 #   agent-box               check only, change nothing (same as ./setup.sh)
 #   agent-box install       install or fix everything that is missing
 #   agent-box sync          git pull this repo, then install
-#   agent-box off [host]    shut a Windows/WSL host down (default: the configured host)
+#   agent-box off [host]    shut a host down (default: this host, or the first on a client)
 #
 # Options (install saves them to ~/.config/agent-box/config for later runs):
 #   --role host|client      default: macOS -> client, WSL/Linux -> host
-#   --host NAME             Tailscale name of the host (default: pc)
-#   --user NAME             Linux user on the host, for clients (asked if missing)
+#   --host NAME             on a host: its Tailscale name (default: pc)
+#   --host [USER@]NAME,...  on a client: the hosts to connect to (default: pc)
+#   --user NAME             Linux user for client hosts given without USER@ (asked if missing)
 #   --vault NAME            Proton Pass vault agents may read (default: Agents)
 #   --autonomous on|off     Claude works without prompts inside its sandbox (default: off)
 #
 # A "host" runs agents, a "client" is where you work from. The environment
-# variables AGENT_ROLE, AGENT_HOST, AGENT_USER, PASS_VAULT and AGENT_AUTONOMOUS
-# work too.
+# variables AGENT_ROLE, AGENT_HOST, AGENT_HOSTS, AGENT_USER, PASS_VAULT and
+# AGENT_AUTONOMOUS work too.
 # Written for bash 3.2 so it runs on stock macOS.
 
 set -uo pipefail
@@ -39,6 +40,7 @@ config_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | tail
 # Precedence: command-line flags, then environment, then saved config, then defaults.
 ROLE="${AGENT_ROLE:-$(config_get AGENT_ROLE)}"
 AGENT_HOST="${AGENT_HOST:-$(config_get AGENT_HOST)}"
+AGENT_HOSTS="${AGENT_HOSTS:-$(config_get AGENT_HOSTS)}"
 AGENT_USER="${AGENT_USER:-$(config_get AGENT_USER)}"
 PASS_VAULT="${PASS_VAULT:-$(config_get PASS_VAULT)}"
 AUTONOMOUS="${AGENT_AUTONOMOUS:-$(config_get AGENT_AUTONOMOUS)}"
@@ -436,25 +438,35 @@ check_agent_box_cmd() { [ "$(readlink "$BIN_DIR/agent-box" 2>/dev/null)" = "$SCR
 install_agent_box_cmd() { mkdir -p "$BIN_DIR" && ln -sfn "$SCRIPT" "$BIN_DIR/agent-box"; }
 
 config_body() {
-  printf 'AGENT_ROLE=%s\nAGENT_HOST=%s\nAGENT_USER=%s\nPASS_VAULT=%s\nAGENT_AUTONOMOUS=%s\n' \
-    "$ROLE" "$AGENT_HOST" "$AGENT_USER" "$PASS_VAULT" "$AUTONOMOUS"
+  printf 'AGENT_ROLE=%s\n' "$ROLE"
+  if [ "$ROLE" = host ]; then printf 'AGENT_HOST=%s\n' "$AGENT_HOST"
+  else printf 'AGENT_HOSTS=%s\n' "$AGENT_HOSTS"; fi
+  printf 'PASS_VAULT=%s\nAGENT_AUTONOMOUS=%s\n' "$PASS_VAULT" "$AUTONOMOUS"
 }
 check_config_saved() { [ -f "$CONFIG_FILE" ] && config_body | cmp -s - "$CONFIG_FILE"; }
 install_config_saved() { mkdir -p "$(dirname "$CONFIG_FILE")" && config_body > "$CONFIG_FILE"; }
 
 # ---------------------------------------------------------------- shutdown
 
-# `agent-box off`: asks a Windows/WSL host to shut down. The Windows task
-# "agent-box remote shutdown" polls `_shutdown-pending` every minute.
+# `agent-box off`: shuts a host down. A WSL host can't power off Windows itself,
+# so it leaves a flag that the Windows task "agent-box remote shutdown" polls every
+# minute. Other Linux hosts power off directly, which needs passwordless sudo.
+OFF_SCRIPT='if grep -qi microsoft /proc/version; then
+  mkdir -p ~/.agent-box && touch ~/.agent-box/shutdown && echo "Windows turns off within about 2 minutes."
+else
+  sudo -n systemctl poweroff && echo "Powering off."
+fi'
 request_shutdown() {
-  local target="${1:-$AGENT_HOST}"
-  if [ "$ROLE" = host ] && [ "$target" = "$AGENT_HOST" ]; then
-    mkdir -p "$(dirname "$SHUTDOWN_FLAG")" && touch "$SHUTDOWN_FLAG" || exit 1
-  else
-    ssh -o ConnectTimeout=10 "$target" 'mkdir -p ~/.agent-box && touch ~/.agent-box/shutdown' \
-      || die "couldn't reach $target"
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    if [ "$ROLE" = host ]; then target="$AGENT_HOST"; else target="$(host_names | head -n 1)"; fi
   fi
-  echo "Shutdown requested for $target; Windows turns off within about 2 minutes."
+  echo "Shutting down $target."
+  if [ "$ROLE" = host ] && [ "$target" = "$AGENT_HOST" ]; then
+    sh -c "$OFF_SCRIPT" || exit 1
+  else
+    ssh -o ConnectTimeout=10 "$target" "$OFF_SCRIPT" || die "couldn't shut down $target"
+  fi
 }
 
 # Succeeds once for a request made in the last 5 minutes. Old requests are
@@ -574,59 +586,67 @@ install_linger() { sudo loginctl enable-linger "$USER"; }
 
 check_tailscale_client() { have tailscale || [ -d /Applications/Tailscale.app ]; }
 
+# A client lists its hosts in AGENT_HOSTS as space-separated [user@]name entries.
+host_name() { echo "${1#*@}"; }
+host_user() { case "$1" in *@*) echo "${1%@*}" ;; esac; }
+host_names() { local h; for h in $AGENT_HOSTS; do host_name "$h"; done; }
+
 ssh_block() {
-  printf 'Host %s\n    HostName %s\n    User %s' "$AGENT_HOST" "$AGENT_HOST" "$AGENT_USER"
+  local h n sep=""
+  for h in $AGENT_HOSTS; do
+    n="$(host_name "$h")"
+    printf '%sHost %s\n    HostName %s\n    User %s' "$sep" "$n" "$n" "$(host_user "$h")"
+    sep=$'\n\n'
+  done
 }
-current_ssh_user() {
-  awk -v s="$MARK_START" -v e="$MARK_END" '
-    $0 == s { inside = 1; next }
-    $0 == e { inside = 0; next }
-    inside && $1 == "User" { print $2 }
-  ' "$SSH_CONFIG" 2>/dev/null
-}
-check_ssh_config() {
-  [ -n "$AGENT_USER" ] || AGENT_USER="$(current_ssh_user)"
-  [ -n "$AGENT_USER" ] && block_matches "$SSH_CONFIG" "$(ssh_block)"
-}
+hosts_without_user() { local h; for h in $AGENT_HOSTS; do [ -n "$(host_user "$h")" ] || echo "$h"; done; }
+check_ssh_config() { [ -z "$(hosts_without_user)" ] && block_matches "$SSH_CONFIG" "$(ssh_block)"; }
 install_ssh_config() {
-  if [ -z "$AGENT_USER" ]; then
-    need_tty || { info "set AGENT_USER=<linux user on $AGENT_HOST>"; return 1; }
-    printf '    Linux user on %s: ' "$AGENT_HOST"
-    read -r AGENT_USER
-    [ -n "$AGENT_USER" ] || return 1
-  fi
+  local h u list=""
+  for h in $AGENT_HOSTS; do
+    if [ -z "$(host_user "$h")" ]; then
+      need_tty || { info "give the user as --host <user>@$h"; return 1; }
+      printf '    Linux user on %s: ' "$h"
+      read -r u
+      [ -n "$u" ] || return 1
+      h="$u@$h"
+    fi
+    list="${list:+$list }$h"
+  done
+  AGENT_HOSTS="$list"
   mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
   replace_block "$SSH_CONFIG" "$(ssh_block)"
   chmod 600 "$SSH_CONFIG"
 }
 
-check_ssh_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$AGENT_HOST" true </dev/null >/dev/null 2>&1; }
+# The per-host steps below act on CUR_HOST.
+check_ssh_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$CUR_HOST" true </dev/null >/dev/null 2>&1; }
 install_ssh_reachable() {
-  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$AGENT_HOST" true </dev/null \
-    || { info "is $AGENT_HOST turned on and online in Tailscale?"; return 1; }
+  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CUR_HOST" true </dev/null \
+    || { info "is $CUR_HOST turned on and online in Tailscale?"; return 1; }
 }
 
 check_herdr_machine() {
   herdr machine list --json 2>/dev/null \
-    | jq -e --arg l "$AGENT_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
+    | jq -e --arg l "$CUR_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
 }
 install_herdr_machine() {
   need_tty || return 1
-  herdr machine add "$AGENT_HOST" --label "$AGENT_HOST"
+  herdr machine add "$CUR_HOST" --label "$CUR_HOST"
 }
 
 # ---------------------------------------------------------------- main
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
-OFF_TARGET=""
+OFF_TARGET="" HOST_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     check|install|sync) MODE="$1" ;;
     off) MODE=off; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
-    --host) AGENT_HOST="${2:-}"; shift ;;
+    --host) HOST_ARG="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
     --vault) PASS_VAULT="${2:-}"; shift ;;
     --autonomous) AUTONOMOUS="${2:-}"; shift ;;
@@ -640,12 +660,30 @@ done
 if [ -z "$ROLE" ]; then
   if [ "$PLATFORM" = mac ]; then ROLE=client; else ROLE=host; fi
 fi
-AGENT_HOST="${AGENT_HOST:-pc}"
+if [ "$ROLE" = host ]; then
+  [ -n "$HOST_ARG" ] && AGENT_HOST="$(host_name "$HOST_ARG")"
+  AGENT_HOST="${AGENT_HOST:-pc}"
+else
+  [ -n "$HOST_ARG" ] && AGENT_HOSTS="$(printf '%s' "$HOST_ARG" | tr ',' ' ')"
+  # Older configs saved a single AGENT_HOST and AGENT_USER.
+  [ -n "$AGENT_HOSTS" ] || AGENT_HOSTS="${AGENT_HOST:-pc}"
+  if [ -n "$AGENT_USER" ]; then
+    _hosts=""
+    for _h in $AGENT_HOSTS; do
+      [ -n "$(host_user "$_h")" ] || _h="$AGENT_USER@$_h"
+      _hosts="${_hosts:+$_hosts }$_h"
+    done
+    AGENT_HOSTS="$_hosts"
+  fi
+fi
 PASS_VAULT="${PASS_VAULT:-Agents}"
 AUTONOMOUS="${AUTONOMOUS:-off}"
 case "$ROLE" in host|client) ;; *) die "--role must be host or client" ;; esac
 case "$AUTONOMOUS" in on|off) ;; *) die "--autonomous must be on or off" ;; esac
 [ "$ROLE" = host ] && [ "$PLATFORM" = mac ] && die "macOS is supported as a client only"
+case "$ROLE:$(uname -m)" in
+  host:armv6l|host:armv7l) die "hosts need a 64-bit OS (Claude Code and herdr have no 32-bit ARM builds)" ;;
+esac
 
 if [ "$MODE" = off ]; then
   request_shutdown "$OFF_TARGET"
@@ -657,6 +695,7 @@ if [ "$MODE" = sync ]; then
 fi
 
 printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
+if [ "$ROLE" = client ]; then printf 'hosts: %s\n' "$AGENT_HOSTS"; fi
 
 section "Base"
 step "curl, git, jq"                      check_base_tools          install_base_tools
@@ -725,13 +764,15 @@ if have pass-cli && check_token && check_pp; then
 fi
 
 if [ "$ROLE" = client ]; then
-  section "Connection to $AGENT_HOST"
-  step "SSH config for '$AGENT_HOST'"        check_ssh_config          install_ssh_config
+  section "Connection to hosts"
+  step "SSH config for $(host_names | paste -sd, - | sed 's/,/, /g')" check_ssh_config install_ssh_config
   if check_ssh_config; then
-    step "$AGENT_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
-  fi
-  if have herdr && check_ssh_reachable; then
-    step "herdr machine '$AGENT_HOST' saved" check_herdr_machine       install_herdr_machine
+    for CUR_HOST in $(host_names); do
+      step "$CUR_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
+      if have herdr && check_ssh_reachable; then
+        step "herdr machine '$CUR_HOST' saved" check_herdr_machine     install_herdr_machine
+      fi
+    done
   fi
 fi
 
@@ -739,7 +780,7 @@ section "Settings"
 step "saved to ~/.config/agent-box/config" check_config_saved       install_config_saved
 
 if [ "$ROLE" = client ]; then
-  note "Keep Tailscale connected on this machine (it is the only login to $AGENT_HOST)."
+  note "Keep Tailscale connected on this machine (it is the only login to your hosts)."
 fi
 if [ "$ROLE" = host ]; then
   note "Tailscale admin console: disable key expiry for '$AGENT_HOST'."
