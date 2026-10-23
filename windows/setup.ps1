@@ -157,7 +157,7 @@ function Get-TaskPassword {
         Write-Info "With a Microsoft account, use its password, not your PIN."
         $secure = Read-Host "Windows password for $TaskUser" -AsSecureString
         $script:TaskPassword = (New-Object System.Net.NetworkCredential("", $secure)).Password
-        $script:Notes.Add("If you change your Windows password, delete the 'agent-box' tasks and rerun with -Install.")
+        $script:Notes.Add("If you change your Windows password, run the agent-box install command again.")
     }
     $script:TaskPassword
 }
@@ -272,7 +272,7 @@ Write-Host ("{0} ok - {1} installed - {2} missing - {3} failed" -f `
 if ($Notes.Count -gt 0) {
     Write-Host ""
     Write-Host "Manual steps:"
-    $Notes | ForEach-Object { Write-Host "  - $_" }
+    $Notes | Select-Object -Unique | ForEach-Object { Write-Host "  - $_" }
 }
 if (-not $Install -and $Counts.missing -gt 0) {
     Write-Host ""
