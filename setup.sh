@@ -5,6 +5,9 @@
 #   agent-box install       install or fix everything that is missing
 #   agent-box sync          git pull this repo, then install
 #   agent-box off [host]    shut a host down (default: this host, or the first on a client)
+#   agent-box add [user@]address [--host name]
+#                           from a client: set up a Linux machine reachable over SSH
+#                           (e.g. pi@raspberrypi.local) as a host and connect to it
 #
 # Options (install saves them to ~/.config/agent-box/config for later runs):
 #   --role host|client      default: macOS -> client, WSL/Linux -> host
@@ -635,14 +638,58 @@ install_herdr_machine() {
   herdr machine add "$CUR_HOST" --label "$CUR_HOST"
 }
 
+# ---------------------------------------------------------------- add
+
+# `agent-box add`: copies this repo to a Linux machine over plain SSH (password
+# is fine, asked once), runs the host install there, then adds it to this
+# client's hosts. Afterwards the machine is reached over Tailscale by name.
+add_host() {
+  local addr="$1" name="$2" base remote_user remote_name entry h hosts=""
+  [ "$ROLE" = client ] || die "run 'agent-box add' from a client"
+  [ -n "$addr" ] || die "usage: agent-box add [user@]address [--host name]"
+  need_tty || exit 1
+  base="$(basename "$REPO_DIR")"
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  set -- -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/agent-box-%C" -o ControlPersist=600 \
+    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10
+
+  read -r remote_user remote_name <<<"$(ssh "$@" "$addr" 'echo "$(whoami) $(hostname -s)"')"
+  [ -n "$remote_user" ] || die "couldn't reach $addr over SSH"
+  name="${name:-$remote_name}"
+  [ "$(ssh "$@" "$addr" uname -s)" = Linux ] || die "$addr isn't Linux"
+
+  echo "Copying $base to $addr:~/$base"
+  if [ "$PLATFORM" = mac ]; then
+    COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$(dirname "$REPO_DIR")" -czf - "$base"
+  else
+    tar -C "$(dirname "$REPO_DIR")" -czf - "$base"
+  fi | ssh "$@" "$addr" "tar -xzf - -C ~ 2>/dev/null; test -d ~/$base/.git &&
+    sed -i 's#url = https://github.com/#url = git@github.com:#' ~/$base/.git/config" \
+    || die "copying to $addr failed"
+
+  echo "Setting up $addr as host '$name'"
+  ssh -t "$@" "$addr" "~/$base/setup.sh install --role host --host $name" \
+    || echo "Some host steps didn't finish; rerun 'agent-box install' on $name later."
+  ssh "$@" -O exit "$addr" 2>/dev/null
+
+  entry="$remote_user@$name"
+  for h in $AGENT_HOSTS; do
+    [ "$(host_name "$h")" = "$name" ] || hosts="${hosts:+$hosts }$h"
+  done
+  hosts="${hosts:+$hosts }$entry"
+  echo "Connecting this machine to $name"
+  exec "$SCRIPT" install --host "$(printf '%s' "$hosts" | tr ' ' ',')"
+}
+
 # ---------------------------------------------------------------- main
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
-OFF_TARGET="" HOST_ARG=""
+OFF_TARGET="" HOST_ARG="" ADD_TARGET="" ADD_NAME=""
 while [ $# -gt 0 ]; do
   case "$1" in
     check|install|sync) MODE="$1" ;;
+    add) MODE=add; case "${2:-}" in ""|-*) ;; *) ADD_TARGET="$2"; shift ;; esac ;;
     off) MODE=off; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
@@ -660,6 +707,8 @@ done
 if [ -z "$ROLE" ]; then
   if [ "$PLATFORM" = mac ]; then ROLE=client; else ROLE=host; fi
 fi
+# For add, --host names the new host instead of replacing the host list.
+if [ "$MODE" = add ]; then ADD_NAME="$HOST_ARG"; HOST_ARG=""; fi
 if [ "$ROLE" = host ]; then
   [ -n "$HOST_ARG" ] && AGENT_HOST="$(host_name "$HOST_ARG")"
   AGENT_HOST="${AGENT_HOST:-pc}"
@@ -685,6 +734,9 @@ case "$ROLE:$(uname -m)" in
   host:armv6l|host:armv7l) die "hosts need a 64-bit OS (Claude Code and herdr have no 32-bit ARM builds)" ;;
 esac
 
+if [ "$MODE" = add ]; then
+  add_host "$ADD_TARGET" "$ADD_NAME"
+fi
 if [ "$MODE" = off ]; then
   request_shutdown "$OFF_TARGET"
   exit 0

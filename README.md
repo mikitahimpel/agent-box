@@ -27,6 +27,7 @@ agent-box                  # check (before the first install: ./setup.sh)
 agent-box install          # fix
 agent-box sync             # git pull this repo, then install
 agent-box off [host]       # shut a host down remotely
+agent-box add user@address # turn a Linux machine on your network into a host (from the Mac)
 ```
 
 | Option | Default | Meaning |
@@ -115,20 +116,18 @@ Use `./setup.sh install --host <linux user>@pc` the first time (add more hosts c
 
 Any Linux machine can be a second host that works exactly like `pc`: Tailscale SSH, herdr server at boot, Claude Code, `gh` and Proton Pass. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and herdr have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
 
-On the Pi:
+Turn SSH on for the Pi (Raspberry Pi Imager → *Enable SSH*, or `sudo raspi-config` → Interface Options → SSH). Then, from the Mac:
 ```bash
-sudo apt update && sudo apt install -y git gh
-gh auth login
-gh repo clone mikitahimpel/agent-box ~/agent-box
-~/agent-box/setup.sh install --host pi
+agent-box add pi@raspberrypi.local --host pi
 ```
-Then `claude` once to log in, and in the Tailscale admin console disable key expiry for `pi`. The SSH `accept` rule from step 4 already covers it. Create a separate Proton Pass agent token for the Pi.
+Use your Pi's user and address. It asks for the Pi's password once, then:
+1. copies this repo to `~/agent-box` on the Pi (with the git remote switched to SSH, so `agent-box sync` works there)
+2. runs `setup.sh install --role host --host pi` on the Pi, in your terminal: same prompts as on the PC (Tailscale login link, GitHub login, Proton Pass token)
+3. adds `pi` to the Mac's hosts and runs the client install, so `pi` shows up in herdr next to `pc`
 
-On the Mac, list both hosts:
-```bash
-agent-box install --host gimpel@pc,pi@pi
-```
-`pi` then shows up in herdr next to `pc`. `agent-box off pi` powers it off directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
+Without `--host`, the host is named after the Pi's hostname. Afterwards, log in to Claude once in a `pi` pane (`claude`), and disable key expiry for `pi` in the Tailscale admin console. The SSH `accept` rule from step 4 already covers it. Create a separate Proton Pass agent token for the Pi.
+
+`agent-box off pi` powers it off directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
 
 ## Daily use
 
