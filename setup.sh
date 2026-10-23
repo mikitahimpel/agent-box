@@ -180,6 +180,25 @@ install_path_in_login_shell() {
   replace_block "$rc" 'export PATH="$HOME/.local/bin:$PATH"'
 }
 
+# Anything here owned by root (left by an earlier `sudo`) makes the installers
+# fail with "permission denied".
+OWNED_DIRS=".local .config .claude .ssh"
+foreign_files() {
+  local d
+  for d in $OWNED_DIRS; do
+    [ -e "$HOME/$d" ] && find "$HOME/$d" ! -user "$(id -u)" -print -quit 2>/dev/null
+  done
+}
+check_home_owned() { [ -z "$(foreign_files)" ]; }
+install_home_owned() {
+  local d
+  info "taking back files in your home folder owned by another user (root)"
+  for d in $OWNED_DIRS; do
+    [ -e "$HOME/$d" ] && sudo chown -R "$(id -u):$(id -g)" "$HOME/$d"
+  done
+  return 0
+}
+
 check_claude() { have claude; }
 install_claude() { curl -fsSL https://claude.ai/install.sh | bash; }
 
@@ -377,7 +396,8 @@ install_gh() {
 check_gh_auth() { gh auth status -h github.com >/dev/null 2>&1; }
 install_gh_auth() {
   need_tty || return 1
-  gh auth login -h github.com -p ssh --skip-ssh-key -s admin:public_key -w
+  info "if no browser opens, go to https://github.com/login/device on any device and enter the code"
+  gh auth login -h github.com -p https -s admin:public_key -w
 }
 
 check_gh_protocol() { [ "$(gh config get -h github.com git_protocol 2>/dev/null)" = ssh ]; }
@@ -415,6 +435,7 @@ install_github_ssh() {
   if ! gh api user/keys >/dev/null 2>&1; then
     need_tty || return 1
     info "gh needs permission to add SSH keys to your account"
+    info "if no browser opens, go to https://github.com/login/device on any device and enter the code"
     gh auth refresh -h github.com -s admin:public_key || return 1
   fi
   if ! github_has_key "$pub"; then
@@ -826,6 +847,7 @@ fi
 printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
 
 section "Base"
+step "home folder files owned by you"     check_home_owned          install_home_owned
 step "curl, git, jq"                      check_base_tools          install_base_tools
 step "~/.local/bin on login-shell PATH"   check_path_in_login_shell install_path_in_login_shell
 step "agent-box command"                  check_agent_box_cmd       install_agent_box_cmd
