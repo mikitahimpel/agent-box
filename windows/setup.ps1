@@ -182,9 +182,20 @@ function New-BootAndRepeatTriggers([int]$Minutes) {
         (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $Minutes))
     )
 }
+# Windows checks the password when the task is registered; a wrong one is asked again.
 function Register-UserTask([string]$Name, $Action, $Triggers, $Settings) {
-    Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Triggers -Settings $Settings `
-        -User $TaskUser -Password (Get-TaskPassword) -Force | Out-Null
+    for ($try = 1; ; $try++) {
+        try {
+            Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Triggers -Settings $Settings `
+                -User $TaskUser -Password (Get-TaskPassword) -Force -ErrorAction Stop | Out-Null
+            return
+        } catch {
+            $badPassword = $_.Exception.HResult -eq -2147023570 -or $_.Exception.Message -match 'password'
+            if (-not $badPassword -or $try -ge 3) { throw }
+            Write-Host "            Windows rejected that password, try again." -ForegroundColor Yellow
+            $script:TaskPassword = $null
+        }
+    }
 }
 
 $watchdogBody = @"
