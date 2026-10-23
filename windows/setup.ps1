@@ -67,6 +67,13 @@ function Get-AcPowerValue([string]$Sub, [string]$Setting) {
     [Convert]::ToInt32($hex[$hex.Count - 2].Value, 16)
 }
 
+# Missing when the driver has no power-off option, which counts as never powered off.
+function Get-WifiPowerSetting($Adapter) {
+    Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceName -like "$($Adapter.PnPDeviceID)*" } |
+        Select-Object -First 1
+}
+
 function Get-WifiAdapter {
     Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
         Where-Object { $_.PhysicalMediaType -match '802\.11' } |
@@ -127,10 +134,13 @@ Step "Sleep on AC power: never" {
 
 $wifi = Get-WifiAdapter
 if ($wifi) {
+    # "Allow the computer to turn off this device" in Device Manager. Set-NetAdapterPowerManagement
+    # can't change it, so this goes through the same WMI setting the checkbox uses.
     Step "Wi-Fi adapter '$($wifi.Name)' never powered off to save power" {
-        (Get-NetAdapterPowerManagement -Name $wifi.Name).AllowComputerToTurnOffDevice -ne "Enabled"
+        $p = Get-WifiPowerSetting $wifi
+        (-not $p) -or (-not $p.Enable)
     } {
-        Set-NetAdapterPowerManagement -Name $wifi.Name -AllowComputerToTurnOffDevice Disabled -NoRestart
+        Set-CimInstance -InputObject (Get-WifiPowerSetting $wifi) -Property @{ Enable = $false }
     }
 } else {
     Write-Info "no Wi-Fi adapter found; skipping Wi-Fi checks"
