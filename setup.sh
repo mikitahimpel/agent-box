@@ -658,7 +658,7 @@ with_timeout() {
   "$@" & pid=$!
   ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watcher=$!
   wait "$pid" 2>/dev/null; rc=$?
-  kill "$watcher" 2>/dev/null
+  { kill "$watcher"; wait "$watcher"; } 2>/dev/null
   return $rc
 }
 
@@ -750,8 +750,13 @@ check_herdr_machine() {
     | jq -e --arg l "$CUR_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
 }
 install_herdr_machine() {
-  need_tty || return 1
-  herdr machine add "$CUR_HOST" --label "$CUR_HOST"
+  local out
+  out="$(herdr machine add "$CUR_HOST" --label "$CUR_HOST" </dev/null 2>&1)" && return 0
+  printf '%s\n' "$out" | sed 's/^/    /'
+  case "$out" in
+    *"is running v"*) info "herdr versions differ: run 'herdr update' on both machines, outside herdr, then rerun" ;;
+  esac
+  return 1
 }
 
 # ---------------------------------------------------------------- add
