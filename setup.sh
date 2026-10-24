@@ -240,6 +240,7 @@ pp_script() {
 # pp: pass-cli that logs in with the stored agent token when the session has expired.
 # Managed by agent-box; local edits are overwritten.
 set -euo pipefail
+export PATH="$BIN_DIR:\$PATH"
 export PROTON_PASS_SESSION_DIR="\${PROTON_PASS_SESSION_DIR:-\$HOME/.local/state/pass-agent}"
 export PROTON_PASS_AGENT_REASON="\${PROTON_PASS_AGENT_REASON:-agent on \$(hostname)}"
 
