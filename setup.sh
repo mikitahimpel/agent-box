@@ -674,18 +674,18 @@ candidate_users() {
     for h in $AGENT_HOSTS; do host_user "$h"; done
     awk 'tolower($1) == "user" { print $2 }' "$SSH_CONFIG" 2>/dev/null
     echo "$USER"
-  } | awk 'NF && !seen[$0]++'
+  } | awk 'NF && $0 != "root" && !seen[$0]++'
 }
-# probe_host <name>: prints user@name if a candidate user can log in and the
-# machine has agent-box installed.
+# probe_host <name>: prints user@name for the first candidate user that can log
+# in and has agent-box installed.
 probe_host() {
-  local u rc
+  local u
   for u in $(candidate_users); do
-    with_timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-      "$u@$1" 'test -e ~/.local/bin/agent-box' </dev/null >/dev/null 2>&1
-    rc=$?
-    [ "$rc" = 0 ] && { echo "$u@$1"; return 0; }
-    [ "$rc" = 255 ] || return 1
+    if with_timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      "$u@$1" 'test -e ~/.local/bin/agent-box' </dev/null >/dev/null 2>&1; then
+      echo "$u@$1"
+      return 0
+    fi
   done
   return 1
 }
