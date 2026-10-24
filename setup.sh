@@ -640,8 +640,8 @@ with_timeout() {
   local secs="$1" pid watcher rc
   shift
   "$@" & pid=$!
-  ( sleep "$secs"; kill "$pid" 2>/dev/null ) & watcher=$!
-  wait "$pid"; rc=$?
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & watcher=$!
+  wait "$pid" 2>/dev/null; rc=$?
   kill "$watcher" 2>/dev/null
   return $rc
 }
@@ -712,10 +712,21 @@ install_ssh_config() {
 }
 
 # The per-host steps below act on CUR_HOST.
-check_ssh_reachable() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$CUR_HOST" true </dev/null >/dev/null 2>&1; }
+check_ssh_reachable() {
+  with_timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 "$CUR_HOST" true </dev/null >/dev/null 2>&1
+}
 install_ssh_reachable() {
-  ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CUR_HOST" true </dev/null \
-    || { info "is $CUR_HOST turned on and online in Tailscale?"; return 1; }
+  local out
+  out="$(with_timeout 20 ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "$CUR_HOST" true </dev/null 2>&1)" \
+    && return 0
+  case "$out" in
+    *"additional check"*)
+      info "Tailscale SSH asks for a browser check on every login, which herdr can't do."
+      info "At https://login.tailscale.com/admin/acls change the \"ssh\" rule's \"action\" from"
+      info "\"check\" to \"accept\" and save. This is once for all your machines." ;;
+    *) info "is $CUR_HOST turned on and online in Tailscale?" ;;
+  esac
+  return 1
 }
 
 check_herdr_machine() {
