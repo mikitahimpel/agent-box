@@ -225,15 +225,18 @@ stored_token() {
 check_token() { valid_token "$(stored_token)"; }
 install_token() {
   need_tty || return 1
-  local token try
+  local raw token try
   info "Create an agent token at pass.proton.me → Settings → Access tokens"
   info "(vault: $PASS_VAULT, expiry: 1 year, 'Use for AI agent' on), then paste it."
   for try in 1 2 3; do
     printf '    token (hidden): '
-    read -rs token; echo
-    token="$(printf '%s' "$token" | tr -d '[:space:]')"
+    read -rs raw; echo
+    # Terminals may wrap a paste in escape codes or add spaces; keep only the token.
+    token="$(printf '%s' "$raw" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\[20[01]~//g' \
+      | grep -o 'pst_[^[:space:]]*::[^[:space:]]*' | head -n 1)"
     valid_token "$token" && break
-    info "that isn't an agent token; it starts with pst_ and contains ::"
+    info "Not accepted. Paste the whole token: it begins with pst_ and has :: in the middle."
+    info "Got ${#raw} characters; pst_ $(case "$raw" in *pst_*) echo found ;; *) echo missing ;; esac), :: $(case "$raw" in *::*) echo found ;; *) echo missing ;; esac)."
     token=""
   done
   [ -n "$token" ] || return 1
