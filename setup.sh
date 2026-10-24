@@ -211,20 +211,31 @@ install_herdr_claude() { herdr integration install claude; }
 check_pass_cli() { have pass-cli; }
 install_pass_cli() { curl -fsSL https://proton.me/download/pass-cli/install.sh | bash; }
 
-check_token() {
+# Agent tokens look like pst_<token>::<key>.
+valid_token() {
+  case "$1" in *[[:space:]]*) return 1 ;; pst_?*::?*) return 0 ;; *) return 1 ;; esac
+}
+stored_token() {
   if [ "$PLATFORM" = mac ]; then
-    security find-generic-password -s "$TOKEN_SERVICE" >/dev/null 2>&1
+    security find-generic-password -s "$TOKEN_SERVICE" -w 2>/dev/null
   else
-    [ -s "$TOKEN_FILE" ]
+    cat "$TOKEN_FILE" 2>/dev/null
   fi
 }
+check_token() { valid_token "$(stored_token)"; }
 install_token() {
   need_tty || return 1
-  local token
+  local token try
   info "Create an agent token at pass.proton.me → Settings → Access tokens"
   info "(vault: $PASS_VAULT, expiry: 1 year, 'Use for AI agent' on), then paste it."
-  printf '    token (hidden): '
-  read -rs token; echo
+  for try in 1 2 3; do
+    printf '    token (hidden): '
+    read -rs token; echo
+    token="$(printf '%s' "$token" | tr -d '[:space:]')"
+    valid_token "$token" && break
+    info "that isn't an agent token; it starts with pst_ and contains ::"
+    token=""
+  done
   [ -n "$token" ] || return 1
   if [ "$PLATFORM" = mac ]; then
     security add-generic-password -U -a "$USER" -s "$TOKEN_SERVICE" -w "$token"
@@ -786,6 +797,8 @@ add_host() {
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
 OFF_TARGET="" HOST_ARG="" ADD_TARGET="" ADD_NAME=""
+ORIG_ARGS=()
+for _a in "$@"; do [ "$_a" = sync ] || ORIG_ARGS+=("$_a"); done
 while [ $# -gt 0 ]; do
   case "$1" in
     check|install|sync) MODE="$1" ;;
@@ -853,7 +866,8 @@ if [ "$MODE" = off ]; then
 fi
 if [ "$MODE" = sync ]; then
   git -C "$REPO_DIR" pull --ff-only || die "git pull failed in $REPO_DIR"
-  MODE=install
+  # Bash has already read part of the old script, so run the updated one.
+  exec "$SCRIPT" install "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
 fi
 
 printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
@@ -918,7 +932,7 @@ step "git name and email"                 check_git_identity        install_git_
 
 section "Secrets (Proton Pass)"
 step "pass-cli"                           check_pass_cli            install_pass_cli
-step "agent token stored"                 check_token               install_token
+step "agent token stored (pst_…::…)"     check_token               install_token
 step "pp wrapper"                         check_pp                  install_pp
 step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
