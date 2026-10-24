@@ -213,7 +213,7 @@ install_pass_cli() { curl -fsSL https://proton.me/download/pass-cli/install.sh |
 
 # Agent tokens look like pst_<token>::<key>.
 valid_token() {
-  case "$1" in *[[:space:]]*) return 1 ;; pst_?*::?*) return 0 ;; *) return 1 ;; esac
+  case "$1" in *[[:space:]]*|pst_*pst_*) return 1 ;; pst_?*::?*) return 0 ;; *) return 1 ;; esac
 }
 stored_token() {
   if [ "$PLATFORM" = mac ]; then
@@ -232,8 +232,9 @@ install_token() {
     printf '    token (hidden): '
     read -rs raw; echo
     # Terminals may wrap a paste in escape codes or add spaces; keep only the token.
+    # A token pasted twice comes back joined; split at each pst_ and keep the first.
     token="$(printf '%s' "$raw" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\[20[01]~//g' \
-      | grep -o 'pst_[^[:space:]]*::[^[:space:]]*' | head -n 1)"
+      | awk '{ gsub(/pst_/, "\npst_"); print }' | grep -o 'pst_[^[:space:]]*::[^[:space:]]*' | head -n 1)"
     valid_token "$token" && break
     info "Not accepted. Paste the whole token: it begins with pst_ and has :: in the middle."
     info "Got ${#raw} characters; pst_ $(case "$raw" in *pst_*) echo found ;; *) echo missing ;; esac), :: $(case "$raw" in *::*) echo found ;; *) echo missing ;; esac)."
