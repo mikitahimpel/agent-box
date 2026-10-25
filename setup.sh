@@ -18,11 +18,13 @@
 #                           on Tailscale that run agent-box, plus earlier ones)
 #   --user NAME             Linux user for client hosts given without USER@ (asked if missing)
 #   --vault NAME            Proton Pass vault agents may read (default: Agents)
+#   --token-vaults A,B,...  vaults to pick for this machine's Proton Pass token
+#                           (default: described by role when the token is asked)
 #   --autonomous on|off     Claude works without prompts inside its sandbox (default: off)
 #
 # A "host" runs agents, a "client" is where you work from. The environment
-# variables AGENT_ROLE, AGENT_HOST, AGENT_HOSTS, AGENT_USER, PASS_VAULT and
-# AGENT_AUTONOMOUS work too.
+# variables AGENT_ROLE, AGENT_HOST, AGENT_HOSTS, AGENT_USER, PASS_VAULT,
+# PASS_TOKEN_VAULTS and AGENT_AUTONOMOUS work too.
 # Written for bash 3.2 so it runs on stock macOS.
 
 set -uo pipefail
@@ -49,10 +51,19 @@ AGENT_HOST="${AGENT_HOST:-$(config_get AGENT_HOST)}"
 AGENT_HOSTS="${AGENT_HOSTS:-$(config_get AGENT_HOSTS)}"
 AGENT_USER="${AGENT_USER:-$(config_get AGENT_USER)}"
 PASS_VAULT="${PASS_VAULT:-$(config_get PASS_VAULT)}"
+PASS_TOKEN_VAULTS="${PASS_TOKEN_VAULTS:-$(config_get PASS_TOKEN_VAULTS)}"
 AUTONOMOUS="${AGENT_AUTONOMOUS:-$(config_get AGENT_AUTONOMOUS)}"
 
-TOKEN_SERVICE="proton-pass-agent"
-TOKEN_FILE="$HOME/.config/pass-agent/token"
+# One Proton Pass token per machine, shared with project tools: Keychain on macOS,
+# libsecret on Linux when secret-tool works, else TOKEN_FILE. pass-cli keeps its
+# session in its default directory.
+TOKEN_SERVICE="proton-pass-token"
+TOKEN_ACCOUNT="default"
+TOKEN_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/proton-pass/token"
+# Where agent-box kept its own token and session before.
+OLD_TOKEN_SERVICE="proton-pass-agent"
+OLD_TOKEN_FILE="$HOME/.config/pass-agent/token"
+OLD_SESSION_DIR="$HOME/.local/state/pass-agent"
 BIN_DIR="$HOME/.local/bin"
 HERDR_CONFIG="$HOME/.config/herdr/config.toml"
 HERDR_UNIT="$HOME/.config/systemd/user/herdr.service"
@@ -219,17 +230,82 @@ valid_token() {
 }
 stored_token() {
   if [ "$PLATFORM" = mac ]; then
-    security find-generic-password -s "$TOKEN_SERVICE" -w 2>/dev/null
+    security find-generic-password -s "$TOKEN_SERVICE" -a "$TOKEN_ACCOUNT" -w 2>/dev/null
   else
+    have secret-tool && secret-tool lookup service "$TOKEN_SERVICE" account "$TOKEN_ACCOUNT" 2>/dev/null && return 0
     cat "$TOKEN_FILE" 2>/dev/null
   fi
 }
+save_token() {
+  if [ "$PLATFORM" = mac ]; then
+    security add-generic-password -U -a "$TOKEN_ACCOUNT" -s "$TOKEN_SERVICE" -l "Proton Pass token" -w "$1" || return 1
+  elif have secret-tool && printf '%s' "$1" \
+      | secret-tool store --label "Proton Pass token" service "$TOKEN_SERVICE" account "$TOKEN_ACCOUNT" 2>/dev/null; then
+    rm -f "$TOKEN_FILE"
+  else
+    mkdir -p "$(dirname "$TOKEN_FILE")" && chmod 700 "$(dirname "$TOKEN_FILE")" || return 1
+    ( umask 077; printf '%s' "$1" > "$TOKEN_FILE" ) && chmod 600 "$TOKEN_FILE" || return 1
+  fi
+  [ "$(stored_token)" = "$1" ]
+}
 check_token() { valid_token "$(stored_token)"; }
+
+has_old_token() {
+  if [ "$PLATFORM" = mac ]; then
+    security find-generic-password -s "$OLD_TOKEN_SERVICE" >/dev/null 2>&1
+  else
+    [ -e "$OLD_TOKEN_FILE" ]
+  fi
+}
+old_token() {
+  if [ "$PLATFORM" = mac ]; then
+    security find-generic-password -s "$OLD_TOKEN_SERVICE" -w 2>/dev/null
+  else
+    cat "$OLD_TOKEN_FILE" 2>/dev/null
+  fi
+}
+remove_old_token() {
+  local n
+  if [ "$PLATFORM" = mac ]; then
+    for n in 1 2 3; do security delete-generic-password -s "$OLD_TOKEN_SERVICE" >/dev/null 2>&1 || break; done
+  else
+    rm -f "$OLD_TOKEN_FILE"
+    rmdir "$(dirname "$OLD_TOKEN_FILE")" 2>/dev/null
+  fi
+  ! has_old_token
+}
+
+# What to pick under "vaults" when creating this machine's token.
+token_vaults() {
+  if [ -n "$PASS_TOKEN_VAULTS" ]; then
+    printf '%s\n' "$PASS_TOKEN_VAULTS" | sed 's/ *, */, /g'
+  elif [ "$ROLE" = host ]; then
+    echo "$PASS_VAULT and your project dev vaults (e.g. Memoxia); never release vaults"
+  else
+    echo "$PASS_VAULT and your project vaults, release vaults included (e.g. Memoxia, Memoxia Release)"
+  fi
+}
+
 install_token() {
+  local raw token try old
+  # An earlier agent-box kept the token elsewhere; move it rather than ask again.
+  old="$(old_token)"
+  if valid_token "$old"; then
+    info "moving the token from the old agent-box storage"
+    save_token "$old" && remove_old_token || return 1
+    info "it still sees only the vaults it was created for; to add vaults, replace it (README → Secrets)"
+    return 0
+  fi
   need_tty || return 1
-  local raw token try
-  info "Create an agent token at pass.proton.me → Settings → Access tokens"
-  info "(vault: $PASS_VAULT, expiry: 1 year, 'Use for AI agent' on), then paste it."
+  info "Create this machine's token at pass.proton.me → Settings → Access tokens → New token:"
+  info "  name: $(hostname -s), expiry: 1 year, 'Use for AI agent' on"
+  info "  vaults: $(token_vaults)"
+  if [ "$ROLE" = host ]; then
+    case "$(printf '%s' "$PASS_TOKEN_VAULTS" | tr '[:upper:]' '[:lower:]')" in
+      *release*) info "  warning: --token-vaults names a release vault; hosts shouldn't get release vaults" ;;
+    esac
+  fi
+  info "pp and project tools on this machine all use it. Paste it here."
   for try in 1 2 3; do
     printf '    token (hidden): '
     read -rs raw; echo
@@ -243,31 +319,40 @@ install_token() {
     token=""
   done
   [ -n "$token" ] || return 1
-  if [ "$PLATFORM" = mac ]; then
-    security add-generic-password -U -a "$USER" -s "$TOKEN_SERVICE" -w "$token"
-  else
-    mkdir -p "$(dirname "$TOKEN_FILE")" && chmod 700 "$(dirname "$TOKEN_FILE")"
-    ( umask 077; printf '%s' "$token" > "$TOKEN_FILE" )
-  fi
+  save_token "$token"
+}
+
+# Leftovers of the old storage: a token the new one replaced and pp's own session.
+check_no_old_pass() { ! has_old_token && [ ! -e "$OLD_SESSION_DIR" ]; }
+install_no_old_pass() {
+  check_token || { info "store this machine's token first"; return 1; }
+  remove_old_token && rm -rf "$OLD_SESSION_DIR"
 }
 
 pp_script() {
   cat <<EOF
 #!/usr/bin/env bash
-# pp: pass-cli that logs in with the stored agent token when the session has expired.
+# pp: pass-cli that logs in with this machine's Proton Pass token when the session
+# has expired. Uses pass-cli's default session, shared with project tools.
 # Managed by agent-box; local edits are overwritten.
 set -euo pipefail
 export PATH="$BIN_DIR:\$PATH"
-export PROTON_PASS_SESSION_DIR="\${PROTON_PASS_SESSION_DIR:-\$HOME/.local/state/pass-agent}"
 export PROTON_PASS_AGENT_REASON="\${PROTON_PASS_AGENT_REASON:-agent on \$(hostname)}"
 
-if ! pass-cli info >/dev/null 2>&1; then
+token() {
   if [[ "\$(uname)" == Darwin ]]; then
-    token=\$(security find-generic-password -s $TOKEN_SERVICE -w)
+    security find-generic-password -s $TOKEN_SERVICE -a $TOKEN_ACCOUNT -w
   else
-    token=\$(<"$TOKEN_FILE")
+    if command -v secret-tool >/dev/null 2>&1 \\
+      && secret-tool lookup service $TOKEN_SERVICE account $TOKEN_ACCOUNT 2>/dev/null; then
+      return 0
+    fi
+    cat "\${XDG_CONFIG_HOME:-\$HOME/.config}/proton-pass/token"
   fi
-  PROTON_PASS_PERSONAL_ACCESS_TOKEN="\$token" pass-cli login >/dev/null
+}
+
+if ! pass-cli info >/dev/null 2>&1; then
+  PROTON_PASS_PERSONAL_ACCESS_TOKEN="\$(token)" pass-cli login >/dev/null
 fi
 
 exec pass-cli "\$@"
@@ -289,6 +374,8 @@ claude_md_block() {
 - Put references in .env files: \`API_KEY=pass://$PASS_VAULT/<item>/<field>\`
 - Run commands that need secrets via: \`pp run --env-file .env -- <command>\`
 - Set PROTON_PASS_AGENT_REASON to a short reason before reading secrets.
+- This machine has one Proton Pass session and token, shared by pp and project tools.
+  Don't set PROTON_PASS_SESSION_DIR, log in or out, or read the stored token.
 EOF
   if [ "$ROLE" = host ]; then
     cat <<EOF
@@ -485,7 +572,9 @@ config_body() {
   printf 'AGENT_ROLE=%s\n' "$ROLE"
   if [ "$ROLE" = host ]; then printf 'AGENT_HOST=%s\n' "$AGENT_HOST"
   else printf 'AGENT_HOSTS=%s\n' "$AGENT_HOSTS"; fi
-  printf 'PASS_VAULT=%s\nAGENT_AUTONOMOUS=%s\n' "$PASS_VAULT" "$AUTONOMOUS"
+  printf 'PASS_VAULT=%s\n' "$PASS_VAULT"
+  [ -z "$PASS_TOKEN_VAULTS" ] || printf 'PASS_TOKEN_VAULTS=%s\n' "$PASS_TOKEN_VAULTS"
+  printf 'AGENT_AUTONOMOUS=%s\n' "$AUTONOMOUS"
 }
 check_config_saved() { [ -f "$CONFIG_FILE" ] && config_body | cmp -s - "$CONFIG_FILE"; }
 install_config_saved() { mkdir -p "$(dirname "$CONFIG_FILE")" && config_body > "$CONFIG_FILE"; }
@@ -844,6 +933,7 @@ while [ $# -gt 0 ]; do
     --host) HOST_ARG="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
     --vault) PASS_VAULT="${2:-}"; shift ;;
+    --token-vaults) PASS_TOKEN_VAULTS="${2:-}"; shift ;;
     --autonomous) AUTONOMOUS="${2:-}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -967,7 +1057,11 @@ step "git name and email"                 check_git_identity        install_git_
 
 section "Secrets (Proton Pass)"
 step "pass-cli"                           check_pass_cli            install_pass_cli
-step "agent token stored (pst_…::…)"     check_token               install_token
+step "Proton Pass token stored (pst_…::…)" check_token             install_token
+if [ "$MODE" = check ] && ! check_token && has_old_token; then
+  info "found the token of an older agent-box; install moves it"
+fi
+step "no old agent-box token or pp session" check_no_old_pass       install_no_old_pass
 step "pp wrapper"                         check_pp                  install_pp
 step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
