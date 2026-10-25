@@ -66,9 +66,10 @@ Options override what it decides. `install` saves them to `~/.config/agent-box/c
 | `--host USER@NAME,...` | found on Tailscale | On a client: exactly these hosts, e.g. `gimpel@pc,pi@pi` |
 | `--user NAME` | tried automatically | On a client: Linux user for hosts listed without `USER@` |
 | `--vault NAME` | `Agents` | Proton Pass vault agents may read |
+| `--token-vaults A,B,...` | described by role | Vaults to pick when creating this machine's Proton Pass token, e.g. `"Agents,Memoxia"` (see [Secrets](#secrets-one-proton-pass-token-per-machine)) |
 | `--autonomous on\|off` | `off` | Claude works without permission prompts inside its sandbox (see below) |
 
-Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -- --autonomous on`. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_HOSTS`, `AGENT_USER` and `PASS_VAULT` work too.
+Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -- --autonomous on`. The environment variables `AGENT_ROLE`, `AGENT_HOST`, `AGENT_HOSTS`, `AGENT_USER`, `PASS_VAULT` and `PASS_TOKEN_VAULTS` work too.
 
 ## What's in this repo
 
@@ -119,7 +120,7 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - herdr, plus its server as a systemd user service with linger, so it runs without a login
 - Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
-- Proton Pass CLI, the agent token (asked once) and the `pp` wrapper
+- Proton Pass CLI, this machine's Proton Pass token (asked once) and the `pp` wrapper
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
@@ -182,13 +183,29 @@ Every machine pushes over SSH with its **own** key, so if one machine is lost yo
 
 The keys have no passphrase so agents can push with nobody at the keyboard. They are deliberately not kept in Proton Pass: the stored agent token would unlock them just as easily, and a per-machine key is quicker to revoke than a shared one.
 
-## Secrets: Proton Pass agent tokens
+## Secrets: one Proton Pass token per machine
 
-Agents read secrets from one Proton Pass vault (`Agents` by default) through a **scoped agent token**. Each token can only see the vaults you pick, is read-only by default, and logs every read with a reason.
+Each machine has exactly one Proton Pass login, shared by `pp` (agent-box) and every project tool that reads secrets (for example memoxia's `memoxia-secrets`):
 
-1. In **pass.proton.me → Settings → Access tokens → New token**, create one token per machine (`pc`, `mac`): expiry 1 year, vault `Agents`, **Use for AI agent** on.
-2. The install asks for the token once. On macOS it goes in the Keychain; on Linux/WSL in `~/.config/pass-agent/token` (mode 600).
-3. `pp` wraps `pass-cli`. Agent sessions last 2 hours, and `pp` logs back in with the stored token whenever the session has expired.
+- **One token per machine:** a scoped personal access token that sees only the vaults that machine needs, is read-only by default, and logs every read with a reason.
+- **One session:** pass-cli's default session directory. Nothing sets `PROTON_PASS_SESSION_DIR`; if you export it yourself, it is respected.
+
+| | Session (pass-cli default) | Token |
+|---|---|---|
+| macOS | `~/Library/Application Support/proton-pass-cli` | Keychain, service `proton-pass-token`, account `default` |
+| Linux, WSL | `${XDG_DATA_HOME:-~/.local/share}/proton-pass-cli` | libsecret (`secret-tool`, `service=proton-pass-token account=default`) when it works, else `${XDG_CONFIG_HOME:-~/.config}/proton-pass/token` (mode 600, folder 700) |
+
+Which vaults the token covers depends on the machine:
+
+| Machine | Vaults |
+|---|---|
+| Your Mac (client) | `Agents` and your project vaults, release vaults included (e.g. `Memoxia`, `Memoxia Release`) |
+| A host (the PC, a Pi) | `Agents` and your project dev vaults (e.g. `Memoxia`), **never** release vaults |
+| An external contributor | only the project's vault (e.g. `Memoxia`) |
+
+1. In **pass.proton.me → Settings → Access tokens → New token**, create the machine's token: named after the machine, expiry 1 year, the vaults above, **Use for AI agent** on. The install prints the vaults to pick; `--token-vaults "Agents,Memoxia"` makes it name exact vaults.
+2. The install asks for the token once and stores it as above.
+3. `pp` wraps `pass-cli` from your PATH. Agent sessions last 2 hours; when `pass-cli info` fails, `pp` logs back in with `PROTON_PASS_PERSONAL_ACCESS_TOKEN=<token> pass-cli login`. Every read is labelled with `PROTON_PASS_AGENT_REASON` (default `agent on <hostname>`).
 
 Agents use it like this (the `~/.claude/CLAUDE.md` block tells them to):
 ```bash
@@ -200,9 +217,18 @@ pp run --env-file .env -- npm test
 
 Check what agents read with `pass-cli agent monitor <token-name>` (logged in as yourself) or under **Manage vault access** in the web app.
 
-**Yearly:** create new tokens before they expire. Delete the stored token (`security delete-generic-password -s proton-pass-agent` on macOS, `rm ~/.config/pass-agent/token` on Linux) and rerun `agent-box install`.
+**Moving from older agent-box versions:** they kept the token in the Keychain item `proton-pass-agent` (macOS) or `~/.config/pass-agent/token` (Linux) and their own session in `~/.local/state/pass-agent`. `agent-box install` moves that token into the new storage, deletes the old item, and removes the old session. The moved token still sees only the vaults it was created for (usually just `Agents`), so replace it as below if the machine needs more.
 
-**Note:** anything running as your user, agents included, can read the stored token. Only put in the vault what you're fine with an agent seeing.
+**Replacing the token** (yearly, or to change its vaults): create the new token, delete the stored one and the session, then rerun the install:
+```bash
+security delete-generic-password -s proton-pass-token -a default        # macOS
+secret-tool clear service proton-pass-token account default             # Linux with libsecret
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/proton-pass/token"             # Linux without
+pass-cli logout
+agent-box install
+```
+
+**Note:** anything running as your user, agents included, can read the stored token and use the session. Only give a machine's token the vaults you're fine with an agent on that machine seeing. If you log in to pass-cli as yourself on a machine, that login is the machine's session too, so `pp` and project tools use it until you log out.
 
 ## Restoring WSL from a snapshot
 
@@ -226,7 +252,7 @@ If it doesn't come online:
 
 - `install.ps1` and `windows/setup.ps1` are written for Windows PowerShell 5.1 but haven't been run on a real machine yet. Read their output before trusting them.
 - Host discovery logs in to each new Linux peer with Tailscale SSH to look for agent-box. A peer whose user isn't among the tried ones is skipped; add it with `--host user@name`.
-- `pp` assumes `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
+- `pp` and project tools assume `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
 - If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and run the Windows one-liner again.
 - `wsl --export` of a running distro and the shutdown task's call into WSL are untested on a real PC. Check Task Scheduler's "Last Run Result" after the first week.
 - Snapshots are full copies of Ubuntu and can be large. Point `-BackupDir` at a drive with room.
