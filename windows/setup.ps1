@@ -59,6 +59,15 @@ function Step([string]$Name, [scriptblock]$Check, [scriptblock]$Fix) {
     }
 }
 
+# Files this script owns are rewritten whenever their content differs.
+function Test-ManagedScript([string]$Path, [string]$Body) {
+    (Test-Path $Path) -and ((Get-Content $Path -Raw).Trim() -eq $Body.Trim())
+}
+function Write-ManagedScript([string]$Path, [string]$Body) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
+    Set-Content -Path $Path -Value $Body -Encoding UTF8
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -185,13 +194,6 @@ function Get-TaskPassword {
     $script:TaskPassword
 }
 
-function Test-ManagedScript([string]$Path, [string]$Body) {
-    (Test-Path $Path) -and ((Get-Content $Path -Raw).Trim() -eq $Body.Trim())
-}
-function Write-ManagedScript([string]$Path, [string]$Body) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null
-    Set-Content -Path $Path -Value $Body -Encoding UTF8
-}
 function Test-Task([string]$Name) {
     $null -ne (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue)
 }
