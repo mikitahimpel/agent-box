@@ -261,18 +261,23 @@ Step "WSL keepalive task (boot + every 5 min)" {
     Start-ScheduledTask -TaskName $KeepaliveTask
 }
 
-# `agent-box off` on any machine creates ~/.agent-box/shutdown inside WSL; this task
-# asks WSL whether a fresh request exists and shuts Windows down if so.
+# `agent-box off` / `agent-box restart` on any machine creates ~/.agent-box/shutdown or
+# ~/.agent-box/restart inside WSL; this task asks WSL whether a fresh request exists
+# and shuts Windows down or restarts it.
 $shutdownBody = @"
-# Managed by agent-box. Shuts Windows down when 'agent-box off' was run.
+# Managed by agent-box. Shuts Windows down or restarts it after 'agent-box off' or 'agent-box restart'.
 $pausedCheck
-& wsl.exe -d $Distro -- ~/.local/bin/agent-box _shutdown-pending
+`$action = & wsl.exe -d $Distro -- ~/.local/bin/agent-box _power-pending
 if (`$LASTEXITCODE -eq 0) {
-    shutdown.exe /s /t 30 /c "agent-box: shutdown requested"
+    if ("`$action" -match 'restart') {
+        shutdown.exe /r /t 30 /c "agent-box: restart requested"
+    } else {
+        shutdown.exe /s /t 30 /c "agent-box: shutdown requested"
+    }
 }
 "@
 
-Step "Remote shutdown task (every 1 min)" {
+Step "Remote shutdown/restart task (every 1 min)" {
     (Test-ManagedScript $ShutdownPath $shutdownBody) -and (Test-Task $ShutdownTask)
 } {
     Write-ManagedScript $ShutdownPath $shutdownBody

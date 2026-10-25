@@ -9,7 +9,7 @@ Mac: herdr (Local + "pc") ──ssh over Tailscale──▶ pc = WSL Ubuntu
                                                      tailscaled (Tailscale SSH)
                                                      herdr server (systemd user service)
                                                      Claude Code, projects in ~/
-Windows host: games · WSL keepalive · Wi-Fi watchdog · remote shutdown · weekly WSL snapshot
+Windows host: games · Agents off/on · WSL keepalive · Wi-Fi watchdog · remote shutdown/restart · weekly WSL snapshot
 ```
 
 ## What's in this repo
@@ -53,6 +53,7 @@ agent-box                  # check what's missing (changes nothing)
 agent-box install          # fix
 agent-box sync             # update agent-box, then install (what the one-liner does)
 agent-box off [host]       # shut a host down remotely
+agent-box restart [host]   # restart a host remotely
 agent-box add user@address # set up a Linux machine on your network from the Mac, over plain SSH
 ```
 
@@ -95,7 +96,7 @@ Gigabyte AORUS AM4:
 - Fast Startup off, so startup tasks run and **Agents off** ends when the PC is turned off
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
-- a **remote shutdown** task that turns Windows off after `agent-box off` (checks every minute)
+- a **remote shutdown** task that turns Windows off after `agent-box off`, or restarts it after `agent-box restart` (checks every minute)
 - **Agents off** and **Agents on** shortcuts on the desktop (see [Games](#games-on-the-windows-pc))
 - a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. To change it, run `windows\setup.ps1 -Install -BackupDir D:\wsl-backups -BackupKeep 5`.
 
@@ -144,7 +145,7 @@ agent-box add pi@raspberrypi.local --host pi
 ```
 That asks for the Pi's password once, copies agent-box there, runs the host install in your terminal, then adds the Pi on the Mac. Without `--host`, the name comes from the Pi's hostname.
 
-`agent-box off pi` powers it off directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
+`agent-box off pi` and `agent-box restart pi` act on it directly; that uses `sudo` without a password, which Raspberry Pi OS allows by default.
 
 ## Daily use
 
@@ -153,9 +154,10 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 | Start | Press the power button. **pc** comes online in herdr in about 1–2 min. |
 | Work | Open panes under **pc** in herdr on the Mac. Agents keep running when the Mac closes. |
 | Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. `agent-box off pi` for the Pi. |
+| Restart | `agent-box restart` from the Mac (Windows restarts within ~2 min and comes back on its own). |
 | Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
 | Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
-| Game | Just play. `wsl --shutdown` first if you want the RAM back. |
+| Game | **Agents off** on the PC's desktop first; **Agents on** (or the next power-on) brings them back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
 
 ## Autonomous mode

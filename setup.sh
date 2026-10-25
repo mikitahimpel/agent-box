@@ -5,6 +5,7 @@
 #   agent-box install       install or fix everything that is missing
 #   agent-box sync          git pull this repo, then install
 #   agent-box off [host]    shut a host down (default: this host, or the first on a client)
+#   agent-box restart [host]  restart a host (same default)
 #   agent-box add [user@]address [--host name]
 #                           from a client: set up a Linux machine reachable over SSH
 #                           (e.g. pi@raspberrypi.local) as a host and connect to it
@@ -60,6 +61,7 @@ CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
 SHARED_CLAUDE="$REPO_DIR/claude"
 SHUTDOWN_FLAG="$HOME/.agent-box/shutdown"
+RESTART_FLAG="$HOME/.agent-box/restart"
 SSH_CONFIG="$HOME/.ssh/config"
 MARK_START="# >>> agent-box >>>"
 MARK_END="# <<< agent-box <<<"
@@ -490,35 +492,58 @@ install_config_saved() { mkdir -p "$(dirname "$CONFIG_FILE")" && config_body > "
 
 # ---------------------------------------------------------------- shutdown
 
-# `agent-box off`: shuts a host down. A WSL host can't power off Windows itself,
-# so it leaves a flag that the Windows task "agent-box remote shutdown" polls every
-# minute. Other Linux hosts power off directly, which needs passwordless sudo.
-OFF_SCRIPT='if grep -qi microsoft /proc/version; then
-  mkdir -p ~/.agent-box && touch ~/.agent-box/shutdown && echo "Windows turns off within about 2 minutes."
+# `agent-box off` and `agent-box restart`. A WSL host can't power Windows off
+# itself, so it leaves a flag (~/.agent-box/shutdown or ~/.agent-box/restart) that
+# the Windows task "agent-box remote shutdown" polls every minute. Other Linux
+# hosts power off or reboot directly, which needs passwordless sudo.
+power_script() {  # off | restart
+  local flag=shutdown unit=poweroff wsl_msg="Windows turns off" msg="Powering off."
+  if [ "$1" = restart ]; then
+    flag=restart unit=reboot wsl_msg="Windows restarts" msg="Restarting."
+  fi
+  cat <<EOF
+if grep -qi microsoft /proc/version; then
+  mkdir -p ~/.agent-box && touch ~/.agent-box/$flag && echo "$wsl_msg within about 2 minutes."
 else
-  sudo -n systemctl poweroff && echo "Powering off."
-fi'
-request_shutdown() {
-  local target="${1:-}"
+  sudo -n systemctl $unit && echo "$msg"
+fi
+EOF
+}
+request_power() {  # off | restart, [host]
+  local action="$1" target="${2:-}" script
   if [ -z "$target" ]; then
     if [ "$ROLE" = host ]; then target="$AGENT_HOST"; else target="$(host_names | head -n 1)"; fi
   fi
-  echo "Shutting down $target."
+  script="$(power_script "$action")"
+  if [ "$action" = restart ]; then echo "Restarting $target."; else echo "Shutting down $target."; fi
   if [ "$ROLE" = host ] && [ "$target" = "$AGENT_HOST" ]; then
-    sh -c "$OFF_SCRIPT" || exit 1
+    sh -c "$script" || exit 1
   else
-    ssh -o ConnectTimeout=10 "$target" "$OFF_SCRIPT" || die "couldn't shut down $target"
+    ssh -o ConnectTimeout=10 "$target" "$script" || die "couldn't reach $target"
   fi
 }
 
 # Succeeds once for a request made in the last 5 minutes. Old requests are
-# dropped, so a flag left over from before a reboot never shuts the PC down again.
-shutdown_pending() {
-  [ -f "$SHUTDOWN_FLAG" ] || return 1
+# dropped, so a flag left over from before a reboot never acts again.
+flag_pending() {
+  [ -f "$1" ] || return 1
   local fresh
-  fresh="$(find "$SHUTDOWN_FLAG" -mmin -5)"
-  rm -f "$SHUTDOWN_FLAG"
+  fresh="$(find "$1" -mmin -5)"
+  rm -f "$1"
   [ -n "$fresh" ]
+}
+shutdown_pending() { flag_pending "$SHUTDOWN_FLAG"; }
+# Prints "restart" or "off". Windows tasks installed before restart existed
+# call _shutdown-pending, so they never mistake a restart for a shutdown.
+power_pending() {
+  if flag_pending "$RESTART_FLAG"; then
+    rm -f "$SHUTDOWN_FLAG"
+    echo restart
+  elif shutdown_pending; then
+    echo off
+  else
+    return 1
+  fi
 }
 
 # ---------------------------------------------------------------- host
@@ -805,15 +830,16 @@ add_host() {
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
-OFF_TARGET="" HOST_ARG="" ADD_TARGET="" ADD_NAME=""
+OFF_TARGET="" POWER_ACTION="" HOST_ARG="" ADD_TARGET="" ADD_NAME=""
 ORIG_ARGS=()
 for _a in "$@"; do [ "$_a" = sync ] || ORIG_ARGS+=("$_a"); done
 while [ $# -gt 0 ]; do
   case "$1" in
     check|install|sync) MODE="$1" ;;
     add) MODE=add; case "${2:-}" in ""|-*) ;; *) ADD_TARGET="$2"; shift ;; esac ;;
-    off) MODE=off; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
+    off|restart) MODE=power; POWER_ACTION="$1"; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
+    _power-pending) power_pending; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
     --host) HOST_ARG="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
@@ -869,8 +895,8 @@ esac
 if [ "$MODE" = add ]; then
   add_host "$ADD_TARGET" "$ADD_NAME"
 fi
-if [ "$MODE" = off ]; then
-  request_shutdown "$OFF_TARGET"
+if [ "$MODE" = power ]; then
+  request_power "$POWER_ACTION" "$OFF_TARGET"
   exit 0
 fi
 if [ "$MODE" = sync ]; then
