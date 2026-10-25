@@ -21,6 +21,10 @@ $DataDir       = Join-Path $env:ProgramData "agent-box"
 $WatchdogPath  = Join-Path $DataDir "watchdog.ps1"
 $ShutdownPath  = Join-Path $DataDir "shutdown.ps1"
 $BackupPath    = Join-Path $DataDir "backup.ps1"
+$KeepalivePath = Join-Path $DataDir "keepalive.ps1"
+$AgentsOffPath = Join-Path $DataDir "agents-off.ps1"
+$AgentsOnPath  = Join-Path $DataDir "agents-on.ps1"
+$PausedFlag    = Join-Path $env:LOCALAPPDATA "agent-box\paused"
 $WatchdogTask  = "agent-box net watchdog"
 $KeepaliveTask = "agent-box WSL keepalive"
 $ShutdownTask  = "agent-box remote shutdown"
@@ -108,23 +112,42 @@ Step "WSL distro '$Distro' installed" { Test-Distro } {
     $script:Notes.Add("Reboot, open Ubuntu once to create your Linux user, then rerun this script.")
 }
 
+# Agents are switched off for games ('Agents off'), so WSL may use all but 4GB.
+# A .wslconfig this script did not write is left alone.
+$wslMemory = $WslMemoryGB
+if ($wslMemory -le 0) {
+    $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    $wslMemory = [math]::Max(4, [math]::Round($total / 1GB) - 4)
+}
+$wslConfigBody = "# Managed by agent-box.`r`n[wsl2]`r`nmemory=${wslMemory}GB"
+function Test-ManagedWslConfig {
+    if (-not (Test-Path $WslConfig)) { return $true }
+    $text = (Get-Content $WslConfig -Raw).Trim()
+    # Earlier versions wrote the same file without the marker.
+    (-not $text) -or $text.StartsWith("# Managed by agent-box.") -or ($text -match '^\[wsl2\]\s+memory=\d+GB$')
+}
 Step "WSL memory cap in .wslconfig" {
-    (Test-Path $WslConfig) -and (Select-String -Path $WslConfig -Pattern '^\s*memory\s*=' -Quiet)
+    if (Test-ManagedWslConfig) { Test-ManagedScript $WslConfig $wslConfigBody }
+    else { Select-String -Path $WslConfig -Pattern '^\s*memory\s*=' -Quiet }
 } {
-    if ((Test-Path $WslConfig) -and (Get-Content $WslConfig -Raw).Trim()) {
-        Write-Info "$WslConfig already exists; add 'memory=<N>GB' under [wsl2] yourself"
+    if (-not (Test-ManagedWslConfig)) {
+        Write-Info "$WslConfig was not written by agent-box; add 'memory=<N>GB' under [wsl2] yourself"
         return
     }
-    $gb = $WslMemoryGB
-    if ($gb -le 0) {
-        $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-        $gb = [math]::Max(4, [math]::Floor($total / 1GB / 2))
-    }
-    Set-Content -Path $WslConfig -Value "[wsl2]`r`nmemory=${gb}GB" -Encoding ASCII
-    $script:Notes.Add("WSL memory cap set to ${gb}GB; it applies after 'wsl --shutdown'.")
+    Set-Content -Path $WslConfig -Value $wslConfigBody -Encoding ASCII
+    $script:Notes.Add("WSL memory cap set to ${wslMemory}GB; it applies the next time WSL starts (restart the PC).")
 }
 
 Write-Section "Power"
+# Fast Startup resumes a hibernated kernel, which skips startup task triggers and
+# keeps the last boot time, so 'Agents off' would outlast a power cycle.
+$powerKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+Step "Fast Startup off" {
+    (Get-ItemProperty $powerKey -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled -eq 0
+} {
+    Set-ItemProperty $powerKey -Name HiberbootEnabled -Value 0 -Type DWord
+}
+
 Step "Sleep on AC power: never" {
     (Get-AcPowerValue SUB_SLEEP STANDBYIDLE) -eq 0 -and (Get-AcPowerValue SUB_SLEEP HIBERNATEIDLE) -eq 0
 } {
@@ -214,8 +237,24 @@ Step "Network watchdog task (boot + every 3 min)" {
         -Trigger (New-BootAndRepeatTriggers 3) -User "SYSTEM" -RunLevel Highest -Force | Out-Null
 }
 
-Step "WSL keepalive task (boot + every 5 min)" { Test-Task $KeepaliveTask } {
-    $action = New-ScheduledTaskAction -Execute "wsl.exe" -Argument "-d $Distro -- sleep infinity"
+# 'Agents off' writes the flag; it counts until the next boot or 'Agents on'.
+$pausedCheck = @"
+`$flag = Get-Item '$PausedFlag' -ErrorAction SilentlyContinue
+if (`$flag -and `$flag.LastWriteTime -gt (Get-CimInstance Win32_OperatingSystem).LastBootUpTime) { exit 0 }
+"@
+
+$keepaliveBody = @"
+# Managed by agent-box. Keeps WSL running unless agents were switched off.
+$pausedCheck
+& wsl.exe -d $Distro -- sleep infinity
+"@
+
+Step "WSL keepalive task (boot + every 5 min)" {
+    (Test-ManagedScript $KeepalivePath $keepaliveBody) -and
+        ((Get-ScheduledTask -TaskName $KeepaliveTask).Actions[0].Arguments -like "*$KeepalivePath*")
+} {
+    Write-ManagedScript $KeepalivePath $keepaliveBody
+    $action = New-ScriptAction $KeepalivePath
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
     Register-UserTask $KeepaliveTask $action (New-BootAndRepeatTriggers 5) $settings
@@ -226,6 +265,7 @@ Step "WSL keepalive task (boot + every 5 min)" { Test-Task $KeepaliveTask } {
 # asks WSL whether a fresh request exists and shuts Windows down if so.
 $shutdownBody = @"
 # Managed by agent-box. Shuts Windows down when 'agent-box off' was run.
+$pausedCheck
 & wsl.exe -d $Distro -- ~/.local/bin/agent-box _shutdown-pending
 if (`$LASTEXITCODE -eq 0) {
     shutdown.exe /s /t 30 /c "agent-box: shutdown requested"
@@ -236,9 +276,55 @@ Step "Remote shutdown task (every 1 min)" {
     (Test-ManagedScript $ShutdownPath $shutdownBody) -and (Test-Task $ShutdownTask)
 } {
     Write-ManagedScript $ShutdownPath $shutdownBody
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
-    Register-UserTask $ShutdownTask (New-ScriptAction $ShutdownPath) (New-BootAndRepeatTriggers 1) $settings
+    if (-not (Test-Task $ShutdownTask)) {
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+        Register-UserTask $ShutdownTask (New-ScriptAction $ShutdownPath) (New-BootAndRepeatTriggers 1) $settings
+    }
+}
+
+# Desktop shortcuts to stop WSL with everything in it (agents, CI runners) before
+# a game, and to bring it back. Turning the PC on also brings it back.
+$agentsOffBody = @"
+# Managed by agent-box. Stops WSL and everything in it until 'Agents on' or the next boot.
+New-Item -ItemType Directory -Force -Path '$(Split-Path $PausedFlag)' | Out-Null
+Set-Content -Path '$PausedFlag' -Value (Get-Date -Format o)
+# A task that was already starting WSL can bring it back once.
+& wsl.exe --shutdown
+Start-Sleep -Seconds 5
+& wsl.exe --shutdown
+Write-Host "Agents are off until 'Agents on' or the next time the PC starts."
+Start-Sleep -Seconds 3
+"@
+
+$agentsOnBody = @"
+# Managed by agent-box. Starts WSL again after 'Agents off'.
+Remove-Item -Path '$PausedFlag' -Force -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName '$KeepaliveTask' -ErrorAction SilentlyContinue
+Write-Host "Agents are starting; they show up in herdr within a few minutes."
+Start-Sleep -Seconds 3
+"@
+
+$Desktop = [Environment]::GetFolderPath("Desktop")
+function Test-Shortcut([string]$Name, [string]$Script) {
+    $lnk = Join-Path $Desktop "$Name.lnk"
+    (Test-Path $lnk) -and ((New-Object -ComObject WScript.Shell).CreateShortcut($lnk).Arguments -like "*$Script*")
+}
+function New-Shortcut([string]$Name, [string]$Script) {
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $Desktop "$Name.lnk"))
+    $lnk.TargetPath = "powershell.exe"
+    $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$Script`""
+    $lnk.Save()
+}
+
+Step "'Agents off' and 'Agents on' desktop shortcuts" {
+    (Test-ManagedScript $AgentsOffPath $agentsOffBody) -and (Test-ManagedScript $AgentsOnPath $agentsOnBody) -and
+        (Test-Shortcut "Agents off" $AgentsOffPath) -and (Test-Shortcut "Agents on" $AgentsOnPath)
+} {
+    Write-ManagedScript $AgentsOffPath $agentsOffBody
+    Write-ManagedScript $AgentsOnPath $agentsOnBody
+    New-Shortcut "Agents off" $AgentsOffPath
+    New-Shortcut "Agents on" $AgentsOnPath
 }
 
 $backupBody = @"

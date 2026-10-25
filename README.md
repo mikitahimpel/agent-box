@@ -91,10 +91,12 @@ Gigabyte AORUS AM4:
 `install.ps1` downloads agent-box to `%USERPROFILE%\agent-box` and runs `windows\setup.ps1 -Install`, which sets:
 - sleep on AC power to never
 - Wi-Fi adapter never powered off to save power
-- WSL memory capped at half your RAM
+- WSL memory capped at your RAM minus 4GB (WSL only takes what it uses; switch agents off before games)
+- Fast Startup off, so startup tasks run and **Agents off** ends when the PC is turned off
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
 - a **remote shutdown** task that turns Windows off after `agent-box off` (checks every minute)
+- **Agents off** and **Agents on** shortcuts on the desktop (see [Games](#games-on-the-windows-pc))
 - a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. To change it, run `windows\setup.ps1 -Install -BackupDir D:\wsl-backups -BackupKeep 5`.
 
 The tasks that touch WSL run as your Windows user before anyone logs in, so it asks for your Windows password once.
@@ -103,8 +105,12 @@ If WSL isn't installed yet, it installs Ubuntu and stops. Reboot, open Ubuntu on
 
 Also check these by hand:
 - **BitLocker / Device Encryption:** TPM-only, no PIN.
-- **Fast Startup:** fine to leave on; the repeating tasks cover the cases where it skips startup triggers.
 - **Windows Tailscale:** not needed. If it's installed under the same name as WSL, rename or remove it so they don't clash.
+
+### Games on the Windows PC
+Before a game, double-click **Agents off** on the desktop. It stops WSL and everything in it (agents, herdr, CI runners) and gives its memory back to Windows. The PC then drops out of herdr, and CI jobs for it wait in the queue.
+
+Agents come back with **Agents on**, or by themselves the next time the PC is turned on. Claude conversations that were running can be continued with `claude --resume`.
 
 ### What the Linux install does on a host
 - `/etc/wsl.conf` on WSL: systemd on, Windows drives hidden from agents
