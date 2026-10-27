@@ -160,6 +160,8 @@ detect_platform() {
 }
 
 PLATFORM="$(detect_platform)"
+# Match login shells and pp even before the login profile has been written.
+[ "$PLATFORM" = mac ] || export PROTON_PASS_KEY_PROVIDER="${PROTON_PASS_KEY_PROVIDER:-fs}"
 
 apt_install() {
   have apt-get || { info "apt-get not found; install manually: $*"; return 1; }
@@ -402,6 +404,15 @@ check_claude_md() { block_matches "$CLAUDE_MD" "$(claude_md_block)"; }
 install_claude_md() { replace_block "$CLAUDE_MD" "$(claude_md_block)"; }
 
 check_pp_works() { "$BIN_DIR/pp" info >/dev/null 2>&1; }
+# A session encrypted with a key from the old provider can't be opened; reset the
+# local state once and let pp log back in with the machine's token.
+install_pp_works() {
+  if pass-cli info 2>&1 >/dev/null | grep -q 'file is not a database'; then
+    info "pass-cli's local session uses another key; resetting it"
+    pass-cli logout --force >/dev/null 2>&1
+  fi
+  check_pp_works
+}
 
 # Shared skills, commands and agents live in claude/<kind>/<name> in this repo
 # and are symlinked into ~/.claude/<kind>/<name>.
@@ -1076,7 +1087,7 @@ step "no old agent-box token or pp session" check_no_old_pass       install_no_o
 step "pp wrapper"                         check_pp                  install_pp
 step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
-  step "pp can log in"                    check_pp_works            check_pp_works
+  step "pp can log in"                    check_pp_works            install_pp_works
 fi
 
 if [ "$ROLE" = client ]; then
