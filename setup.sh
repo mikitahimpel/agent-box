@@ -407,7 +407,9 @@ check_pp_works() { "$BIN_DIR/pp" info >/dev/null 2>&1; }
 # A session encrypted with a key from the old provider can't be opened; reset the
 # local state once and let pp log back in with the machine's token.
 install_pp_works() {
-  if pass-cli info 2>&1 >/dev/null | grep -q 'file is not a database'; then
+  local err
+  err="$(pass-cli info 2>&1 >/dev/null)" || true
+  if [[ "$err" == *"file is not a database"* ]]; then
     info "pass-cli's local session uses another key; resetting it"
     pass-cli logout --force >/dev/null 2>&1
   fi
