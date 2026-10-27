@@ -189,6 +189,7 @@ Each machine has exactly one Proton Pass login, shared by `pp` (agent-box) and e
 
 - **One token per machine:** a scoped personal access token that sees only the vaults that machine needs, is read-only by default, and logs every read with a reason.
 - **One session:** pass-cli's default session directory. Nothing sets `PROTON_PASS_SESSION_DIR`; if you export it yourself, it is respected.
+- **One local key (Linux, WSL):** pass-cli encrypts its session with a local key. By default it keeps that key in the kernel keyring, which is separate for every login session, so herdr panes and SSH logins would fight over the one session (`file is not a database`). agent-box sets `PROTON_PASS_KEY_PROVIDER=fs` in the login profile and in `pp`, so pass-cli keeps the key in a file instead. macOS keeps the Keychain.
 
 | | Session (pass-cli default) | Token |
 |---|---|---|
