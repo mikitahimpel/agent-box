@@ -160,6 +160,8 @@ detect_platform() {
 }
 
 PLATFORM="$(detect_platform)"
+# Match login shells and pp even before the login profile has been written.
+[ "$PLATFORM" = mac ] || export PROTON_PASS_KEY_PROVIDER="${PROTON_PASS_KEY_PROVIDER:-fs}"
 
 apt_install() {
   have apt-get || { info "apt-get not found; install manually: $*"; return 1; }
@@ -180,18 +182,27 @@ install_base_tools() {
   esac
 }
 
+login_rc() {
+  case "${SHELL:-}" in
+    */zsh) echo "$HOME/.zprofile" ;;
+    *) echo "$HOME/.profile" ;;
+  esac
+}
+# On Linux pass-cli keeps its local key in the kernel keyring by default, which
+# is per login session: herdr panes and SSH logins would each get a different
+# key for the one shared session and fail with "file is not a database".
+login_shell_block() {
+  echo 'export PATH="$HOME/.local/bin:$PATH"'
+  if [ "$PLATFORM" != mac ]; then
+    echo 'export PROTON_PASS_KEY_PROVIDER="${PROTON_PASS_KEY_PROVIDER:-fs}"'
+  fi
+}
 check_path_in_login_shell() {
   local shell="${SHELL:-/bin/bash}"
-  "$shell" -lc 'case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac' </dev/null >/dev/null 2>&1
+  block_matches "$(login_rc)" "$(login_shell_block)" \
+    && "$shell" -lc 'case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac' </dev/null >/dev/null 2>&1
 }
-install_path_in_login_shell() {
-  local rc
-  case "${SHELL:-}" in
-    */zsh) rc="$HOME/.zprofile" ;;
-    *) rc="$HOME/.profile" ;;
-  esac
-  replace_block "$rc" 'export PATH="$HOME/.local/bin:$PATH"'
-}
+install_path_in_login_shell() { replace_block "$(login_rc)" "$(login_shell_block)"; }
 
 # Anything here owned by root (left by an earlier `sudo`) makes the installers
 # fail with "permission denied".
@@ -338,6 +349,8 @@ pp_script() {
 set -euo pipefail
 export PATH="$BIN_DIR:\$PATH"
 export PROTON_PASS_AGENT_REASON="\${PROTON_PASS_AGENT_REASON:-agent on \$(hostname)}"
+# Same local key from every login session; see login_shell_block in agent-box.
+[[ "\$(uname)" == Darwin ]] || export PROTON_PASS_KEY_PROVIDER="\${PROTON_PASS_KEY_PROVIDER:-fs}"
 
 token() {
   if [[ "\$(uname)" == Darwin ]]; then
@@ -391,6 +404,17 @@ check_claude_md() { block_matches "$CLAUDE_MD" "$(claude_md_block)"; }
 install_claude_md() { replace_block "$CLAUDE_MD" "$(claude_md_block)"; }
 
 check_pp_works() { "$BIN_DIR/pp" info >/dev/null 2>&1; }
+# A session encrypted with a key from the old provider can't be opened; reset the
+# local state once and let pp log back in with the machine's token.
+install_pp_works() {
+  local err
+  err="$(pass-cli info 2>&1 >/dev/null)" || true
+  if [[ "$err" == *"file is not a database"* ]]; then
+    info "pass-cli's local session uses another key; resetting it"
+    pass-cli logout --force >/dev/null 2>&1
+  fi
+  check_pp_works
+}
 
 # Shared skills, commands and agents live in claude/<kind>/<name> in this repo
 # and are symlinked into ~/.claude/<kind>/<name>.
@@ -1000,7 +1024,7 @@ printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM"
 section "Base"
 step "home folder files owned by you"     check_home_owned          install_home_owned
 step "curl, git, jq"                      check_base_tools          install_base_tools
-step "~/.local/bin on login-shell PATH"   check_path_in_login_shell install_path_in_login_shell
+step "login-shell PATH and pass-cli key"  check_path_in_login_shell install_path_in_login_shell
 step "agent-box command"                  check_agent_box_cmd       install_agent_box_cmd
 
 if [ "$ROLE" = host ]; then
@@ -1065,7 +1089,7 @@ step "no old agent-box token or pp session" check_no_old_pass       install_no_o
 step "pp wrapper"                         check_pp                  install_pp
 step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
-  step "pp can log in"                    check_pp_works            check_pp_works
+  step "pp can log in"                    check_pp_works            install_pp_works
 fi
 
 if [ "$ROLE" = client ]; then
