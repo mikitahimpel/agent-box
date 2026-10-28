@@ -751,6 +751,10 @@ Description=Herdr server (agent-box)
 [Service]
 ExecStart=$(command -v herdr) server
 Restart=on-failure
+# Agents and their builds share the machine with other services (CI runners);
+# throttle them before the whole host runs out of memory and stops answering.
+MemoryHigh=40%
+MemoryMax=50%
 
 [Install]
 WantedBy=default.target
