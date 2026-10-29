@@ -1,7 +1,9 @@
 ---
 name: herdr-placement
-description: Use when the user asks to start a task in a new herdr worktree, or to hand a task to a new agent through herdr. Decides whether the task runs on the Mac or on an agent-box host such as pc, then creates the worktree and starts the agent there. Requires HERDR_ENV=1; read the herdr skill for command details.
+description: Use when the user asks to start a task in a new herdr worktree, or to hand a task to a new agent through herdr. Decides whether the task runs on the Mac or on an agent-box host such as pc, then creates the worktree and starts the agent there. Only inside herdr (HERDR_ENV=1); in a Rex session without herdr use rex-placement instead. Read the herdr skill for command details.
 ---
+
+If `HERDR_ENV` is not `1`, stop: this session is not in herdr. In Rex (`REX_SESSION` set), use the rex-placement skill.
 
 # Herdr placement
 

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Start a Claude Code agent on a new git worktree, each in its own Rex session.
+
+  rex-task new --branch NAME [--repo DIR] [--base REF] [--label L]
+               [--prompt TEXT | --prompt-file FILE] [--trust] [--no-focus]
+  rex-task new --interactive [--repo DIR]
+  rex-task rm PATH [--force]
+
+Worktrees go to $REX_WORKTREES_DIR/<repo>/<branch>, by default
+~/.worktrees/<repo>/<branch>. --trust answers Claude's folder trust prompt for
+the new worktree; use it only for the user's own repositories.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import re
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REX_AGENT = os.path.join(HERE, "rex-agent")
+WORKTREES = os.environ.get("REX_WORKTREES_DIR", os.path.expanduser("~/.worktrees"))
+TRUST_PROMPT = "Yes, I trust this folder"
+# Rex runs actions' commands without the shell's PATH, so fall back to where
+# the app installs its CLI.
+REX = os.environ.get("REX_BIN") or shutil.which("rex") or os.path.expanduser(
+    "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/"
+    "Rex Server.app/Contents/MacOS/rex")
+
+
+class Fail(Exception):
+    pass
+
+
+def run(*args, cwd=None, check=True):
+    proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise Fail(proc.stderr.strip() or "%s failed" % " ".join(args))
+    return proc.stdout.strip()
+
+
+def git(repo, *args, check=True):
+    return run("git", "-C", repo, *args, check=check)
+
+
+def repo_root(path):
+    root = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if not root:
+        raise Fail("%s is not in a git repository" % path)
+    # The common dir is the main checkout's .git, so a worktree resolves to its main repo.
+    return os.path.dirname(root) if os.path.basename(root) == ".git" else root
+
+
+def default_base(repo):
+    if git(repo, "remote", check=False):
+        git(repo, "fetch", "--quiet", "origin", check=False)
+        head = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+        if head:
+            return head
+        for name in ("origin/main", "origin/master"):
+            if git(repo, "rev-parse", "--verify", "--quiet", name, check=False):
+                return name
+    return "HEAD"
+
+
+def slug(branch):
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")
+
+
+def add_worktree(repo, branch, base):
+    path = os.path.join(WORKTREES, os.path.basename(repo), slug(branch))
+    if os.path.exists(path):
+        raise Fail("%s already exists" % path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch, check=False):
+        git(repo, "worktree", "add", "--quiet", path, branch)
+    else:
+        git(repo, "worktree", "add", "--quiet", "-b", branch, path, base or default_base(repo))
+    return path
+
+
+def screen(session_id, block_id):
+    return run(REX, "capture", "-s", session_id, "-b", block_id, "--trim", check=False)
+
+
+def answer_trust(session_id, block_id, timeout=20):
+    """Accept the trust prompt if Claude shows one. Its default choice is "No, exit"."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        text = screen(session_id, block_id)
+        if TRUST_PROMPT in text:
+            run(REX, "send-key", "-s", session_id, "-b", block_id, "down", "enter")
+            return True
+        if "❯" in text and "trust" not in text.lower():
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def start(args):
+    repo = repo_root(os.path.abspath(args.repo))
+    path = add_worktree(repo, args.branch, args.base)
+    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompt = f.read()
+    command = ["claude"] + ([prompt] if prompt and prompt.strip() else [])
+    label = args.label or "%s-%s" % (os.path.basename(repo), slug(args.branch))
+    open_args = [REX_AGENT, "open", "--cwd", path, "--label", label]
+    if args.no_focus:
+        open_args.append("--no-focus")
+    opened = json.loads(run(*open_args, "--", *command))
+    trusted = answer_trust(opened["session_id"], opened["block_id"]) if args.trust else False
+    return dict(opened, path=path, branch=args.branch, repo=repo, label=label, trust_answered=trusted)
+
+
+def ask(question, default=None):
+    suffix = " [%s]" % default if default else ""
+    answer = input("%s%s: " % (question, suffix)).strip()
+    return answer or default
+
+
+def interactive(args):
+    print("New task: a worktree with Claude in its own session. Ctrl-C cancels.\n")
+    try:
+        repo = repo_root(os.path.expanduser(ask("Repository", args.repo or os.getcwd())))
+        print("  %s" % repo)
+        args.repo = repo
+        args.branch = ask("Branch")
+        if not args.branch:
+            raise Fail("a branch is needed")
+        args.base = ask("Base", default_base(repo))
+        print("Prompt (empty line to finish, nothing to start Claude idle):")
+        lines = []
+        while True:
+            line = input()
+            if not line:
+                break
+            lines.append(line)
+        args.prompt = "\n".join(lines)
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(130)
+    result = start(args)
+    print("\nStarted %s in %s" % (result["label"], result["path"]))
+    time.sleep(1)
+
+
+def remove(args):
+    path = os.path.realpath(args.path)
+    repo = repo_root(path)
+    agents = json.loads(run(REX_AGENT, "list", "--json"))["agents"]
+    for agent in agents:
+        if agent.get("cwd") and os.path.realpath(agent["cwd"]) == path:
+            run(REX, "kill", agent["session_id"], check=False)
+    git(repo, "worktree", "remove", *(["--force"] if args.force else []), path)
+    print("Removed %s" % path)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="rex-task", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("new")
+    p.add_argument("--repo", default=os.getcwd())
+    p.add_argument("--branch")
+    p.add_argument("--base")
+    p.add_argument("--label")
+    p.add_argument("--prompt")
+    p.add_argument("--prompt-file")
+    p.add_argument("--trust", action="store_true")
+    p.add_argument("--no-focus", action="store_true")
+    p.add_argument("--interactive", action="store_true")
+
+    p = sub.add_parser("rm")
+    p.add_argument("path")
+    p.add_argument("--force", action="store_true")
+
+    args = parser.parse_args()
+    try:
+        if args.command == "rm":
+            remove(args)
+        elif args.interactive:
+            interactive(args)
+        else:
+            if not args.branch:
+                raise Fail("--branch is required")
+            print(json.dumps(start(args)))
+    except Fail as err:
+        print("rex-task: %s" % err, file=sys.stderr)
+        if args.command == "new" and args.interactive:
+            input("Press Enter to close.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -19,6 +19,7 @@ Windows host: games · Agents off/on · WSL keepalive · Wi-Fi watchdog · remot
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks. |
 | `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
+| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
 
 ## Install
 
@@ -79,6 +80,7 @@ Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks |
 | `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
+| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
 
 ## The Windows PC in detail
 
@@ -160,6 +162,25 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 | Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
 | Game | **Agents off** on the PC's desktop first; **Agents on** (or the next power-on) brings them back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
+
+## Rex on the Mac
+
+[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Agents run on the Mac only; hosts such as **pc** stay in herdr.
+
+Claude Code reports its state to Rex itself (Program Status Protocol), so tabs show a spinner while an agent works and the session picker marks agents that are blocked or done. The pieces on top:
+
+| Key | Does |
+|---|---|
+| `shift+cmd+n` | New task: worktree in `~/.worktrees/<repo>/<branch>`, Claude in its own session |
+| `shift+cmd+a` | Go to the agent that needs you: blocked first, then finished |
+| `shift+cmd+h` | Search agent history (`agent-history-rex`, else `agent-history browse`) |
+| `shift+cmd+u` | Token usage dashboard for the focused agent (`agent-tokens`) |
+
+All four are also in the command palette under **Agents**. A shortcut recorded in the app with **Change Shortcut…** overrides these.
+
+From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside herdr, `herdr-placement` applies instead.
+
+Turn on **Remote Control** in Rex's settings (Rex Server) so commands run from a terminal, like `rex-task` or a history resume, can switch the app to the new session. Keys work without it.
 
 ## Autonomous mode
 

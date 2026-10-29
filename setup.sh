@@ -459,6 +459,29 @@ install_shared_claude() {
   done
 }
 
+# Rex on the Mac: rex-agent and rex-task go to ~/.local/bin, and agents.lua
+# is linked beside the user's init.lua, which loads it with require("agents").
+REX_SUPPORT="$HOME/Library/Application Support/com.superlogical.rex"
+REX_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rex"
+REX_LINKS="bin/rex-agent:$BIN_DIR/rex-agent bin/rex-task:$BIN_DIR/rex-task config/agents.lua:$REX_CONFIG_DIR/agents.lua"
+check_rex_agents() {
+  local pair
+  for pair in $REX_LINKS; do
+    [ "$(readlink "${pair#*:}" 2>/dev/null)" = "$REPO_DIR/rex/${pair%%:*}" ] || return 1
+  done
+  grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null
+}
+install_rex_agents() {
+  local pair
+  for pair in $REX_LINKS; do
+    mkdir -p "$(dirname "${pair#*:}")" && ln -sfn "$REPO_DIR/rex/${pair%%:*}" "${pair#*:}" || return 1
+  done
+  grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null ||
+    printf '%s\n' '-- Agent workflow from agent-box.' 'require("agents")' >> "$REX_CONFIG_DIR/init.lua"
+  have rex && rex config reload >/dev/null 2>&1
+  return 0
+}
+
 # Autonomous mode: Bash runs inside Claude's sandbox without prompts, file edits
 # are auto-approved, and Claude refuses to start if the sandbox is unavailable.
 # Hosts outside allowedDomains still prompt; add them to claude/allowed-domains.txt.
@@ -1055,6 +1078,9 @@ step "Claude Code"                        check_claude              install_clau
 step "herdr"                              check_herdr               install_herdr
 have herdr && step "herdr ↔ Claude integration" check_herdr_claude install_herdr_claude
 step "shared Claude config (claude/ in this repo)" check_shared_claude install_shared_claude
+if [ "$PLATFORM" = mac ] && [ -d "$REX_SUPPORT" ]; then
+  step "Rex agent workflow (rex/ in this repo)" check_rex_agents install_rex_agents
+fi
 if [ "$PLATFORM" != mac ] && { [ "$ROLE" = host ] || [ "$AUTONOMOUS" = on ]; }; then
   step "Claude sandbox deps (bubblewrap, socat)" check_sandbox_deps install_sandbox_deps
   have bwrap && step "bubblewrap can create sandboxes" check_bwrap_works install_bwrap_works

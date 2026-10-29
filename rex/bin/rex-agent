@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Find and drive the Claude Code agents running in Rex.
+
+Claude Code reports its state to the terminal with the Program Status Protocol
+(OSC 7501, app=claude-code). Rex keeps those records per terminal block, and the
+record's owner pid leads to ~/.claude/sessions/<pid>.json, which names the
+Claude session. Nothing here keeps state of its own.
+
+  rex-agent list [--json]
+  rex-agent get TARGET [--json]
+  rex-agent read TARGET [--lines N]
+  rex-agent prompt TARGET TEXT [--wait [--timeout SECONDS]]   (TEXT "-" reads stdin)
+  rex-agent send-keys TARGET KEY...
+  rex-agent wait TARGET [--state idle,blocked,done] [--timeout SECONDS]
+  rex-agent focus TARGET
+  rex-agent sessions [--json]
+  rex-agent session-for DIR           (the one session working in DIR, or exit 1)
+  rex-agent open --cwd DIR [--label L] [--session S] [--no-focus] -- COMMAND...
+
+TARGET is a block ID or ID suffix, a Claude session ID, a block label, or a
+session label. A label that matches several agents is an error.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import unquote
+
+TERMINAL = "com.superlogical.terminal"
+CLAUDE_APP = "claude-code"
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+# Rex runs actions' commands without the shell's PATH, so fall back to where
+# the app installs its CLI.
+REX = os.environ.get("REX_BIN") or shutil.which("rex") or os.path.expanduser(
+    "~/Library/Application Support/com.superlogical.rex/RexServer/Versions/Current/"
+    "Rex Server.app/Contents/MacOS/rex")
+
+
+class Fail(Exception):
+    pass
+
+
+def rex(*args, input=None):
+    proc = subprocess.run([REX, *args], input=input, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise Fail(proc.stderr.strip() or "rex %s failed" % args[0])
+    return proc.stdout
+
+
+def rex_json(*args):
+    return json.loads(rex(*args) or "null")
+
+
+def claude_session(pid):
+    try:
+        with open(os.path.join(SESSIONS_DIR, "%d.json" % pid)) as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def claude_record(records):
+    for record in records:
+        if record.get("effective_app", record.get("app")) == CLAUDE_APP and not record.get("id"):
+            return record
+    return None
+
+
+def list_agents():
+    agents = []
+    for session in rex_json("ls", "--json").get("sessions", []):
+        sid = session["session_id"]
+        view = rex_json("session", "inspect", sid, "--json")
+        active = view.get("active_window_id")
+        focused = {w.get("window_id"): w.get("focused_block_id") for w in view.get("windows", [])}
+        for block in rex_json("block", "ls", "-s", sid, "--json").get("blocks", []):
+            if block.get("creator_name") != TERMINAL:
+                continue
+            try:
+                status = rex_json("api", "call", "-s", sid, TERMINAL + ".program_status",
+                                  json.dumps({"block_id": block["block_id"]}))
+            except Fail:
+                continue
+            record = claude_record(status.get("records", []))
+            if record is None:
+                continue
+            pid = (record.get("owner") or {}).get("pid")
+            claude = claude_session(pid)
+            window = block.get("window_id")
+            agents.append({
+                "session_id": sid,
+                "session_label": session.get("label", ""),
+                "window_id": window,
+                "block_id": block["block_id"],
+                "label": block.get("label", ""),
+                "state": record.get("state"),
+                "kind": record.get("kind"),
+                "msg": record.get("msg", ""),
+                "updated_at": record.get("updated_at"),
+                "pid": pid,
+                "claude_session_id": claude.get("sessionId"),
+                "name": claude.get("name"),
+                "cwd": claude.get("cwd"),
+                "placed": block.get("placement") == "placed",
+                "focused": window == active and focused.get(window) == block["block_id"],
+            })
+    return agents
+
+
+def terminal_dir(session_id, block_id):
+    """The foreground program's directory, else the one the shell last reported."""
+    args = json.dumps({"block_id": block_id})
+    try:
+        process = rex_json("api", "call", "-s", session_id, TERMINAL + ".process", args)
+        cwd = (process.get("foreground") or {}).get("cwd")
+        if cwd:
+            return cwd
+        url = rex_json("api", "call", "-s", session_id, TERMINAL + ".pwd", args).get("pwd") or ""
+    except Fail:
+        return None
+    path = unquote(re.sub(r"^file://[^/]*", "", url))
+    return path or None
+
+
+def list_sessions():
+    sessions = []
+    for session in rex_json("ls", "--json").get("sessions", []):
+        sid = session["session_id"]
+        dirs = []
+        for block in rex_json("block", "ls", "-s", sid, "--json").get("blocks", []):
+            if block.get("creator_name") == TERMINAL:
+                path = terminal_dir(sid, block["block_id"])
+                if path and path not in dirs:
+                    dirs.append(path)
+        sessions.append({"session_id": sid, "label": session.get("label", ""), "dirs": dirs})
+    return sessions
+
+
+def cmd_sessions(args):
+    sessions = list_sessions()
+    if args.json:
+        print(json.dumps({"sessions": sessions}, indent=2))
+    else:
+        for session in sessions:
+            print("%-9s %-24s %s" % (session["session_id"][-8:], session["label"][:24],
+                                     "  ".join(session["dirs"])))
+
+
+def cmd_session_for(args):
+    wanted = os.path.realpath(args.dir)
+    matches = [s for s in list_sessions()
+               if any(os.path.realpath(d) == wanted for d in s["dirs"])]
+    if len(matches) != 1:
+        raise Fail("%d sessions work in %s" % (len(matches), wanted))
+    print(json.dumps({"session_id": matches[0]["session_id"], "label": matches[0]["label"]}))
+
+
+def resolve(target, agents=None):
+    agents = list_agents() if agents is None else agents
+    for key in ("block_id", "claude_session_id"):
+        exact = [a for a in agents if a.get(key) == target]
+        if exact:
+            return exact[0]
+    for key in ("label", "session_label", "name"):
+        matches = [a for a in agents if a.get(key) == target]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise Fail("%s %r matches %d agents; use a block ID" % (key, target, len(matches)))
+    suffix = [a for a in agents if a["block_id"].endswith(target)]
+    if len(suffix) == 1:
+        return suffix[0]
+    raise Fail("no agent matches %r" % target)
+
+
+def describe(agent):
+    state = agent["state"] + (":" + agent["kind"] if agent.get("kind") else "")
+    where = agent["session_label"] or agent["session_id"]
+    return "%-9s %-22s %-14s %s  %s" % (
+        agent["block_id"][-8:], where[:22], state, agent.get("cwd") or "", agent.get("msg") or "")
+
+
+def cmd_list(args):
+    agents = list_agents()
+    if args.json:
+        print(json.dumps({"agents": agents}, indent=2))
+    elif not agents:
+        print("No Claude agents are running in Rex.")
+    else:
+        for agent in agents:
+            print(describe(agent))
+
+
+def cmd_get(args):
+    agent = resolve(args.target)
+    print(json.dumps(agent, indent=2) if args.json else describe(agent))
+
+
+def cmd_read(args):
+    agent = resolve(args.target)
+    text = rex("capture", "-s", agent["session_id"], "-b", agent["block_id"], "--trim", "--unwrap")
+    lines = text.splitlines()
+    print("\n".join(lines[-args.lines:] if args.lines else lines))
+
+
+def cmd_prompt(args):
+    agent = resolve(args.target)
+    text = sys.stdin.read() if args.text == "-" else args.text
+    target = ["-s", agent["session_id"], "-b", agent["block_id"]]
+    # Bracketed paste keeps a multi-line prompt in one message instead of
+    # submitting it at the first newline.
+    rex("send", *target, input="\x1b[200~" + text.rstrip("\n") + "\x1b[201~")
+    time.sleep(0.3)
+    rex("send-key", *target, "enter")
+    if args.wait:
+        # The agent may still show "done" from its last turn, so only a record
+        # written after this prompt counts.
+        wait_for(agent["block_id"], FINISHED, args.timeout, newer_than=agent["updated_at"])
+
+
+def cmd_send_keys(args):
+    agent = resolve(args.target)
+    rex("send-key", "-s", agent["session_id"], "-b", agent["block_id"], *args.keys)
+
+
+FINISHED = {"idle", "blocked", "done", "error"}
+
+
+def cmd_wait(args):
+    wait_for(resolve(args.target)["block_id"], set(args.state.split(",")), args.timeout)
+
+
+def wait_for(block, wanted, timeout, newer_than=None):
+    deadline = time.time() + timeout if timeout else None
+    while True:
+        agent = next((a for a in list_agents() if a["block_id"] == block), None)
+        if agent is None:
+            raise Fail("agent %s is gone" % block)
+        if agent["state"] in wanted and agent["updated_at"] != newer_than:
+            print(describe(agent))
+            return
+        if deadline and time.time() > deadline:
+            raise Fail("timed out; agent is %s" % agent["state"])
+        time.sleep(1)
+
+
+def cmd_focus(args):
+    agent = resolve(args.target)
+    focus(agent["session_id"], agent["block_id"])
+
+
+def focus(session_id, block_id):
+    rex("focus", "-s", session_id, block_id)
+    try:
+        rex("do", "session.select", "session_id=" + session_id)
+    except Fail as err:
+        print("rex-agent: focused the pane, but the app did not switch to it (%s). "
+              "Turn on Remote Control in Rex settings to allow this." % err, file=sys.stderr)
+
+
+def cmd_open(args):
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        raise Fail("open needs a command after --")
+    if args.session:
+        out = rex_json("window", "new", "-s", args.session, args.label or "claude", "--json",
+                       "-c", args.cwd, "--keep-open", "--focus=%s" % str(not args.no_focus).lower(),
+                       "--", *command)
+        session_id = rex_json("session", "inspect", args.session, "--json")["session_id"]
+        block_id = out["block_ids"][0]
+    else:
+        out = rex_json("new", args.label or os.path.basename(args.cwd.rstrip("/")), "--json",
+                       "-c", args.cwd, "--keep-open", "--window", "claude", "--", *command)
+        session_id = out["session_id"]
+        block_id = out["initial_windows"][0]["block_ids"][0]
+    if not args.no_focus:
+        focus(session_id, block_id)
+    print(json.dumps({"session_id": session_id, "block_id": block_id}))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="rex-agent", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("list")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_list)
+
+    p = sub.add_parser("get")
+    p.add_argument("target")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_get)
+
+    p = sub.add_parser("read")
+    p.add_argument("target")
+    p.add_argument("--lines", type=int, default=0)
+    p.set_defaults(run=cmd_read)
+
+    p = sub.add_parser("prompt")
+    p.add_argument("target")
+    p.add_argument("text")
+    p.add_argument("--wait", action="store_true", help="return when the agent finishes the turn")
+    p.add_argument("--timeout", type=float, default=0)
+    p.set_defaults(run=cmd_prompt)
+
+    p = sub.add_parser("send-keys")
+    p.add_argument("target")
+    p.add_argument("keys", nargs="+")
+    p.set_defaults(run=cmd_send_keys)
+
+    p = sub.add_parser("wait")
+    p.add_argument("target")
+    p.add_argument("--state", default=",".join(sorted(FINISHED)))
+    p.add_argument("--timeout", type=float, default=0)
+    p.set_defaults(run=cmd_wait)
+
+    p = sub.add_parser("focus")
+    p.add_argument("target")
+    p.set_defaults(run=cmd_focus)
+
+    p = sub.add_parser("sessions")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_sessions)
+
+    p = sub.add_parser("session-for")
+    p.add_argument("dir")
+    p.set_defaults(run=cmd_session_for)
+
+    p = sub.add_parser("open")
+    p.add_argument("--cwd", required=True)
+    p.add_argument("--label")
+    p.add_argument("--session", help="add a tab to this session instead of creating one")
+    p.add_argument("--no-focus", action="store_true")
+    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.set_defaults(run=cmd_open)
+
+    args = parser.parse_args()
+    try:
+        args.run(args)
+    except Fail as err:
+        print("rex-agent: %s" % err, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
