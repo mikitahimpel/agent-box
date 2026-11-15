@@ -65,8 +65,10 @@ OLD_TOKEN_SERVICE="proton-pass-agent"
 OLD_TOKEN_FILE="$HOME/.config/pass-agent/token"
 OLD_SESSION_DIR="$HOME/.local/state/pass-agent"
 BIN_DIR="$HOME/.local/bin"
-HERDR_CONFIG="$HOME/.config/herdr/config.toml"
-HERDR_UNIT="$HOME/.config/systemd/user/herdr.service"
+# What the old herdr TUI left on a host; hosts now run herdr-core (hc) instead.
+OLD_HERDR_DIR="$HOME/.config/herdr"
+OLD_HERDR_UNIT="$HOME/.config/systemd/user/herdr.service"
+OLD_HERDR_HOOK="$HOME/.claude/hooks/herdr-agent-state.sh"
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
@@ -189,7 +191,7 @@ login_rc() {
   esac
 }
 # On Linux pass-cli keeps its local key in the kernel keyring by default, which
-# is per login session: herdr panes and SSH logins would each get a different
+# is per login session: hc terminals and SSH logins would each get a different
 # key for the one shared session and fail with "file is not a database".
 login_shell_block() {
   echo 'export PATH="$HOME/.local/bin:$PATH"'
@@ -226,11 +228,21 @@ install_home_owned() {
 check_claude() { have claude; }
 install_claude() { curl -fsSL https://claude.ai/install.sh | bash; }
 
-check_herdr() { have herdr; }
-install_herdr() { curl -fsSL https://herdr.dev/install.sh | sh; }
+# hc starts programs on a Linux host with the login shell's environment, so
+# claude must be on that PATH, not only on an interactive shell's.
+check_claude_login_path() {
+  "${SHELL:-/bin/bash}" -lc 'command -v claude' </dev/null >/dev/null 2>&1
+}
+install_claude_login_path() {
+  info "claude isn't on the PATH of '${SHELL:-/bin/bash} -l'; it should be in ~/.local/bin"
+  [ -f "$HOME/.bash_profile" ] && [ "$(login_rc)" = "$HOME/.profile" ] \
+    && info "bash reads ~/.bash_profile instead of ~/.profile; source ~/.profile from it"
+  return 1
+}
 
-check_herdr_claude() { herdr integration status 2>&1 | grep '^claude: current' >/dev/null; }
-install_herdr_claude() { herdr integration install claude; }
+# hc (herdr-core) on a host is installed by the client: agent-box there runs
+# 'hc machine add --install', as does adding the machine in the Herdr app.
+hc_installed() { have herdr-core || [ -x "$BIN_DIR/herdr-core" ]; }
 
 check_pass_cli() { have pass-cli; }
 install_pass_cli() { curl -fsSL https://proton.me/download/pass-cli/install.sh | bash; }
@@ -723,6 +735,34 @@ install_tailscale() {
 check_tailscaled() { systemctl is-enabled tailscaled >/dev/null 2>&1 && systemctl is-active tailscaled >/dev/null 2>&1; }
 install_tailscaled() { sudo systemctl enable --now tailscaled; }
 
+# write_root_file <path> <content>, for files under /etc; file_is <path> <content>.
+write_root_file() { sudo mkdir -p "$(dirname "$1")" && printf '%s\n' "$2" | sudo tee "$1" >/dev/null; }
+file_is() { [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]; }
+
+# On WSL, tailscaled is the only way in from the tailnet, so it comes back after
+# any exit, never gives up restarting, and is the last thing the kernel kills.
+TAILSCALED_DROPIN=/etc/systemd/system/tailscaled.service.d/agent-box.conf
+tailscaled_dropin() {
+  cat <<'EOF'
+# Managed by agent-box.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+EOF
+}
+check_tailscaled_restart() {
+  file_is "$TAILSCALED_DROPIN" "$(tailscaled_dropin)" \
+    && [ "$(systemctl show -p Restart --value tailscaled 2>/dev/null)" = always ]
+}
+install_tailscaled_restart() {
+  write_root_file "$TAILSCALED_DROPIN" "$(tailscaled_dropin)" && sudo systemctl daemon-reload || return 1
+  info "OOMScoreAdjust applies the next time tailscaled starts"
+}
+
 ts_running() { [ "$(tailscale status --json 2>/dev/null | jq -r .BackendState)" = Running ]; }
 ts_prefs() { tailscale debug prefs 2>/dev/null || sudo -n tailscale debug prefs 2>/dev/null; }
 
@@ -748,51 +788,195 @@ install_tailscale_up() {
   fi
 }
 
-check_herdr_shell_mode() { [ -f "$HERDR_CONFIG" ] && grep -Eq '^\s*shell_mode\s*=\s*"login"' "$HERDR_CONFIG"; }
-install_herdr_shell_mode() {
-  mkdir -p "$(dirname "$HERDR_CONFIG")"
-  touch "$HERDR_CONFIG"
-  local tmp
-  tmp="$(mktemp)"
-  if grep -Eq '^\s*\[terminal\]' "$HERDR_CONFIG"; then
-    awk '
-      /^[[:space:]]*shell_mode[[:space:]]*=/ { next }
-      { print }
-      /^[[:space:]]*\[terminal\]/ { print "shell_mode = \"login\"" }
-    ' "$HERDR_CONFIG" > "$tmp"
-  else
-    { cat "$HERDR_CONFIG"; printf '\n[terminal]\nshell_mode = "login"\n'; } > "$tmp"
+# The old herdr TUI: its integration hook in Claude, its server unit, its binary
+# and its config. hc and its own folders (herdr-core) are left alone.
+old_herdr_hook_in_settings() {
+  [ -s "$CLAUDE_SETTINGS" ] && grep -q 'herdr-agent-state' "$CLAUDE_SETTINGS"
+}
+check_no_herdr_tui() {
+  ! have herdr && [ ! -e "$OLD_HERDR_UNIT" ] && [ ! -e "$OLD_HERDR_DIR" ] \
+    && [ ! -e "$OLD_HERDR_HOOK" ] && ! old_herdr_hook_in_settings
+}
+install_no_herdr_tui() {
+  local bin tmp
+  have herdr && herdr integration uninstall claude >/dev/null 2>&1
+  if old_herdr_hook_in_settings; then
+    tmp="$(mktemp)"
+    jq '
+      if .hooks then
+        .hooks |= (map_values(
+          map(.hooks |= map(select((.command // "") | contains("herdr-agent-state") | not)))
+          | map(select((.hooks // []) | length > 0))
+        ) | with_entries(select(.value | length > 0)))
+      else . end
+    ' "$CLAUDE_SETTINGS" > "$tmp" || { rm -f "$tmp"; return 1; }
+    cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak" && mv "$tmp" "$CLAUDE_SETTINGS" || return 1
   fi
-  mv "$tmp" "$HERDR_CONFIG"
-}
-
-herdr_unit() {
-  cat <<EOF
-[Unit]
-Description=Herdr server (agent-box)
-
-[Service]
-ExecStart=$(command -v herdr) server
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-EOF
-}
-check_herdr_service() {
-  have herdr && [ -f "$HERDR_UNIT" ] && herdr_unit | cmp -s - "$HERDR_UNIT" \
-    && systemctl --user is-enabled herdr >/dev/null 2>&1 \
-    && systemctl --user is-active herdr >/dev/null 2>&1
-}
-install_herdr_service() {
-  have herdr || return 1
-  mkdir -p "$(dirname "$HERDR_UNIT")"
-  herdr_unit > "$HERDR_UNIT"
-  systemctl --user daemon-reload && systemctl --user enable --now herdr
+  rm -f "$OLD_HERDR_HOOK"
+  if [ -e "$OLD_HERDR_UNIT" ] || systemctl --user cat herdr.service >/dev/null 2>&1; then
+    systemctl --user disable --now herdr.service >/dev/null 2>&1
+    rm -f "$OLD_HERDR_UNIT"
+    systemctl --user daemon-reload
+    systemctl --user reset-failed herdr.service >/dev/null 2>&1
+  fi
+  if have herdr; then
+    bin="$(command -v herdr)"
+    case "$bin" in
+      "$HOME"/*) rm -f "$bin" ;;
+      *) info "remove $bin yourself (it isn't in your home folder)"; return 1 ;;
+    esac
+  fi
+  rm -rf "$OLD_HERDR_DIR"
 }
 
 check_linger() { loginctl show-user "$USER" -p Linger 2>/dev/null | grep 'Linger=yes' >/dev/null; }
 install_linger() { sudo loginctl enable-linger "$USER"; }
+
+# On Linux hc runs its core, and the holders that keep each terminal, as
+# transient services of the user's systemd manager (systemd-run --user), so
+# agents and their builds all run under user@<uid>.service. Capping that unit
+# covers them whatever hc names its units. SSH logins (session scopes) and CI
+# runners (system services) are outside it.
+USER_UNIT="user@$(id -u).service"
+USER_MEMORY_DROPIN="/etc/systemd/system/$USER_UNIT.d/agent-box-memory.conf"
+user_memory_dropin() {
+  cat <<'EOF'
+# Managed by agent-box. Agents and their builds share the machine with other
+# services (CI runners); throttle them before the whole host runs out of memory
+# and stops answering.
+[Service]
+MemoryHigh=60%
+MemoryMax=70%
+EOF
+}
+check_user_memory_cap() {
+  file_is "$USER_MEMORY_DROPIN" "$(user_memory_dropin)" \
+    && [ "$(systemctl show -p MemoryMax --value "$USER_UNIT" 2>/dev/null)" != infinity ]
+}
+install_user_memory_cap() {
+  write_root_file "$USER_MEMORY_DROPIN" "$(user_memory_dropin)" && sudo systemctl daemon-reload || return 1
+  # The running user manager gets the limits now instead of at its next start.
+  sudo systemctl set-property --runtime "$USER_UNIT" MemoryHigh=60% MemoryMax=70%
+}
+
+# ---------------------------------------------------------------- memory
+
+# earlyoom acts before the kernel's OOM killer would stall the machine: it kills
+# one build or test process (node, vitest, workerd, a CI job) and leaves
+# tailscaled, sshd, hc (herdr-core: its core and the holders that keep each
+# terminal) and systemd alone. The names are matched against the
+# process name; quotes would reach earlyoom literally, so the regexes have none.
+EARLYOOM_DEFAULTS=/etc/default/earlyoom
+earlyoom_defaults() {
+  cat <<'EOF'
+# Managed by agent-box. When memory runs low, kill one build or test process,
+# not the whole machine.
+EARLYOOM_ARGS="-r 3600 --prefer ^(node|vitest|jest|workerd|python|Runner.Worker) --avoid ^(tailscaled|sshd|herdr-core|hc|systemd|init|earlyoom)"
+EOF
+}
+check_earlyoom() {
+  have earlyoom && file_is "$EARLYOOM_DEFAULTS" "$(earlyoom_defaults)" \
+    && systemctl is-enabled earlyoom >/dev/null 2>&1 && systemctl is-active earlyoom >/dev/null 2>&1
+}
+install_earlyoom() {
+  have earlyoom || apt_install earlyoom || return 1
+  write_root_file "$EARLYOOM_DEFAULTS" "$(earlyoom_defaults)" \
+    && sudo systemctl enable earlyoom && sudo systemctl restart earlyoom
+}
+
+# Self-hosted GitHub runners (set up outside agent-box) run in their own slice
+# with less memory and CPU than agents, so a burst of CI jobs can't take the
+# host down. Runners are only capped, never created or removed.
+RUNNER_SLICE=agent-box-runners.slice
+runner_slice() {
+  cat <<'EOF'
+# Managed by agent-box. CI runners get less memory and CPU than agents.
+[Unit]
+Description=CI runners (agent-box)
+
+[Slice]
+MemoryHigh=45%
+MemoryMax=50%
+CPUWeight=20
+IOWeight=20
+EOF
+}
+runner_dropin() { printf '# Managed by agent-box.\n[Service]\nSlice=%s\n' "$RUNNER_SLICE"; }
+runner_dropin_path() { echo "/etc/systemd/system/$1.d/agent-box-slice.conf"; }
+# Unit files, templates included (a drop-in for gh-runner@.service covers every instance).
+runner_units() {
+  systemctl list-unit-files --type=service --no-legend 'gh-runner*' 'actions.runner*' 2>/dev/null | awk '{ print $1 }'
+}
+active_runners() {
+  systemctl list-units --type=service --state=active --no-legend --plain 'gh-runner*' 'actions.runner*' 2>/dev/null \
+    | awk '{ print $1 }'
+}
+runners_outside_slice() {
+  local u
+  for u in $(active_runners); do
+    [ "$(systemctl show -p Slice --value "$u" 2>/dev/null)" = "$RUNNER_SLICE" ] || echo "$u"
+  done
+}
+check_runner_caps() {
+  local u
+  file_is "/etc/systemd/system/$RUNNER_SLICE" "$(runner_slice)" || return 1
+  for u in $(runner_units); do
+    file_is "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
+  done
+  [ -z "$(runners_outside_slice)" ]
+}
+install_runner_caps() {
+  local u stale
+  write_root_file "/etc/systemd/system/$RUNNER_SLICE" "$(runner_slice)" || return 1
+  for u in $(runner_units); do
+    write_root_file "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
+  done
+  sudo systemctl daemon-reload || return 1
+  stale="$(runners_outside_slice | tr '\n' ' ')"
+  [ -n "$stale" ] || return 0
+  # Moving a service to another slice needs a restart, which would kill a running job.
+  if pgrep -f 'Runner[.]Worker' >/dev/null; then
+    info "a CI job is running; rerun once it's done (or reboot) to restart: $stale"
+    return 1
+  fi
+  # shellcheck disable=SC2086  # one argument per unit
+  sudo systemctl restart $stale
+}
+
+# `agent-box _busy`, asked by the Windows idle-sleep task every 10 minutes: prints
+# what keeps the host busy and succeeds, or fails when nothing does. Claude's CPU
+# time (its own plus its finished children's) is compared with the previous call,
+# so an agent waiting at its prompt doesn't count as working.
+BUSY_STATE="$HOME/.agent-box/claude-cpu"
+BUSY_LOAD=1.0          # 5-minute load average that counts as heavy work
+BUSY_CLAUDE_SECONDS=5  # Claude CPU seconds since the last call that count as working
+claude_cpu() {  # "pid ticks" per claude process
+  local p
+  for p in $(pgrep -x claude); do
+    awk -v p="$p" '{ print p, $14 + $15 + $16 + $17 }' "/proc/$p/stat" 2>/dev/null
+  done
+}
+host_busy() {
+  local load now secs
+  if pgrep -f 'Runner[.]Worker' >/dev/null; then echo "CI job running"; return 0; fi
+  load="$(cut -d' ' -f2 /proc/loadavg)"
+  if awk -v l="$load" -v m="$BUSY_LOAD" 'BEGIN { exit !(l >= m) }'; then
+    echo "load average $load"
+    return 0
+  fi
+  now="$(claude_cpu)"
+  secs="$({ sed 's/^/old /' "$BUSY_STATE" 2>/dev/null; printf '%s\n' "$now" | sed 's/^/new /'; } \
+    | awk -v hz="$(getconf CLK_TCK)" '
+        $1 == "old" { was[$2] = $3 }
+        $1 == "new" && NF == 3 { d += $3 - was[$2] }
+        END { printf "%d", d / hz }')"
+  mkdir -p "$(dirname "$BUSY_STATE")" && printf '%s\n' "$now" > "$BUSY_STATE"
+  if [ "${secs:-0}" -ge "$BUSY_CLAUDE_SECONDS" ]; then
+    echo "Claude working (${secs}s CPU since the last check)"
+    return 0
+  fi
+  return 1
+}
 
 # ---------------------------------------------------------------- client
 
@@ -898,7 +1082,7 @@ install_ssh_reachable() {
     && return 0
   case "$out" in
     *"additional check"*)
-      info "Tailscale SSH asks for a browser check on every login, which herdr can't do."
+      info "Tailscale SSH asks for a browser check on every login, which hc can't do."
       info "At https://login.tailscale.com/admin/acls change the \"ssh\" rule's \"action\" from"
       info "\"check\" to \"accept\" and save. This is once for all your machines." ;;
     *) info "is $CUR_HOST turned on and online in Tailscale?" ;;
@@ -906,17 +1090,16 @@ install_ssh_reachable() {
   return 1
 }
 
-check_herdr_machine() {
-  herdr machine list --json 2>/dev/null \
-    | jq -e --arg l "$CUR_HOST" '[.. | objects | .label? // empty] | index($l) != null' >/dev/null
+# The Herdr app shows the machines hc knows. --install copies this hc to the
+# host when it has none or an older one.
+check_hc_machine() {
+  hc machine ls --json 2>/dev/null \
+    | jq -e --arg n "$CUR_HOST" '[.machines[]?.name] | index($n) != null' >/dev/null
 }
-install_herdr_machine() {
+install_hc_machine() {
   local out
-  out="$(herdr machine add "$CUR_HOST" --label "$CUR_HOST" </dev/null 2>&1)" && return 0
+  out="$(hc machine add "$CUR_HOST" --name "$CUR_HOST" --install </dev/null 2>&1)" && return 0
   printf '%s\n' "$out" | sed 's/^/    /'
-  case "$out" in
-    *"is running v"*) info "herdr versions differ: run 'herdr update' on both machines, outside herdr, then rerun" ;;
-  esac
   return 1
 }
 
@@ -976,6 +1159,7 @@ while [ $# -gt 0 ]; do
     off|restart) MODE=power; POWER_ACTION="$1"; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
     _power-pending) power_pending; exit $? ;;
+    _busy) host_busy; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
     --host) HOST_ARG="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
@@ -1026,7 +1210,7 @@ case "$ROLE" in host|client) ;; *) die "--role must be host or client" ;; esac
 case "$AUTONOMOUS" in on|off) ;; *) die "--autonomous must be on or off" ;; esac
 [ "$ROLE" = host ] && [ "$PLATFORM" = mac ] && die "macOS is supported as a client only"
 case "$ROLE:$(uname -m)" in
-  host:armv6l|host:armv7l) die "hosts need a 64-bit OS (Claude Code and herdr have no 32-bit ARM builds)" ;;
+  host:armv6l|host:armv7l) die "hosts need a 64-bit OS (Claude Code and hc have no 32-bit ARM builds)" ;;
 esac
 
 if [ "$MODE" = add ]; then
@@ -1062,6 +1246,7 @@ if [ "$ROLE" = host ]; then
   step "Tailscale installed"              check_tailscale           install_tailscale
   if [ "$SYSTEMD" = 1 ]; then
     step "tailscaled enabled at boot"     check_tailscaled          install_tailscaled
+    step "tailscaled restarts after any crash" check_tailscaled_restart install_tailscaled_restart
     step "Tailscale up as '$AGENT_HOST' with Tailscale SSH" check_tailscale_up install_tailscale_up
   else
     info "skipping Tailscale service steps until systemd runs"
@@ -1075,8 +1260,6 @@ fi
 
 section "Agents"
 step "Claude Code"                        check_claude              install_claude
-step "herdr"                              check_herdr               install_herdr
-have herdr && step "herdr ↔ Claude integration" check_herdr_claude install_herdr_claude
 step "shared Claude config (claude/ in this repo)" check_shared_claude install_shared_claude
 if [ "$PLATFORM" = mac ] && [ -d "$REX_SUPPORT" ]; then
   step "Rex agent workflow (rex/ in this repo)" check_rex_agents install_rex_agents
@@ -1089,10 +1272,25 @@ if [ "$AUTONOMOUS" = on ]; then
   step "Claude autonomous mode (sandboxed, no prompts)" check_autonomous install_autonomous
 fi
 if [ "$ROLE" = host ]; then
-  step "herdr panes use login shells"     check_herdr_shell_mode    install_herdr_shell_mode
+  have claude && step "claude on the login-shell PATH (hc starts programs with it)" check_claude_login_path install_claude_login_path
+  if hc_installed; then
+    ok "hc (herdr-core)"
+  else
+    info "hc isn't here yet: it arrives when a client adds this machine (agent-box install"
+    info "there, or the Herdr app's machine list), which runs 'hc machine add --install'"
+  fi
   if [ "$SYSTEMD" = 1 ]; then
-    step "herdr server starts at boot"    check_herdr_service       install_herdr_service
-    step "user services run without login (linger)" check_linger   install_linger
+    step "old herdr TUI removed (server, binary, config, Claude hook)" check_no_herdr_tui install_no_herdr_tui
+    step "hc terminals run without a login (linger)" check_linger   install_linger
+  fi
+fi
+
+if [ "$ROLE" = host ] && [ "$SYSTEMD" = 1 ]; then
+  section "Memory"
+  step "agents capped at 60% (throttled) / 70% of memory" check_user_memory_cap install_user_memory_cap
+  step "earlyoom kills one job, not the machine" check_earlyoom    install_earlyoom
+  if [ -n "$(runner_units)" ]; then
+    step "CI runners capped at 50% of memory, less CPU than agents" check_runner_caps install_runner_caps
   fi
 fi
 
@@ -1134,8 +1332,8 @@ if [ "$ROLE" = client ]; then
   if [ -n "$AGENT_HOSTS" ] && check_ssh_config; then
     for CUR_HOST in $(host_names); do
       step "$CUR_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
-      if have herdr && check_ssh_reachable; then
-        step "herdr machine '$CUR_HOST' saved" check_herdr_machine     install_herdr_machine
+      if have hc && check_ssh_reachable; then
+        step "hc machine '$CUR_HOST' (shows in the Herdr app)" check_hc_machine install_hc_machine
       fi
     done
   fi

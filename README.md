@@ -1,15 +1,16 @@
 # agent-box
 
-Set up machines for running coding agents remotely with [herdr](https://herdr.dev), Tailscale and Proton Pass. Every machine is either a **host** (agents run there: Linux including a Raspberry Pi, or WSL on Windows) or a **client** (you work from it: macOS or Linux). `setup.sh` checks and installs both roles.
+Set up machines for running coding agents remotely with the [Herdr](https://herdr.dev) app and herdr-core (`hc`), Tailscale and Proton Pass. Every machine is either a **host** (agents run there: Linux including a Raspberry Pi, or WSL on Windows) or a **client** (you work from it: macOS or Linux). `setup.sh` checks and installs both roles.
 
-The reference setup is a Windows gaming PC as the host and a Mac as the client. You press the PC's power button. About a minute later, **pc** comes online in [herdr](https://herdr.dev) on your Mac. You open panes there and run Claude Code in WSL Ubuntu. Nothing else needs touching: no Windows login, no monitor, no SSH keys. The same PC stays a normal Windows gaming machine.
+The reference setup is a Windows gaming PC as the host and a Mac as the client. You press the PC's power button. About a minute later, **pc** comes online in the Herdr app on your Mac. You open spaces on it there and run Claude Code in WSL Ubuntu. Nothing else needs touching: no Windows login, no monitor, no SSH keys. The same PC stays a normal Windows gaming machine.
 
 ```
-Mac: herdr (Local + "pc") ──ssh over Tailscale──▶ pc = WSL Ubuntu
-                                                     tailscaled (Tailscale SSH)
-                                                     herdr server (systemd user service)
+Mac: Herdr app (Local + "pc") ──ssh over Tailscale──▶ pc = WSL Ubuntu
+                                                         tailscaled (Tailscale SSH)
+                                                         hc core (started over SSH, systemd user service)
                                                      Claude Code, projects in ~/
-Windows host: games · Agents off/on · WSL keepalive · Wi-Fi watchdog · remote shutdown/restart · weekly WSL snapshot
+Windows host: games · Agents off/on · WSL keepalive + hang watchdog · Wi-Fi watchdog · remote shutdown/restart · weekly WSL snapshot
+              Tailscale "pc-win" + OpenSSH, so you can get in when WSL is down
 ```
 
 ## What's in this repo
@@ -17,7 +18,7 @@ Windows host: games · Agents off/on · WSL keepalive · Wi-Fi watchdog · remot
 | File | Runs on | Does |
 |---|---|---|
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
-| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks. |
+| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks. |
 | `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
 
@@ -38,7 +39,7 @@ irm https://raw.githubusercontent.com/mikitahimpel/agent-box/main/install.ps1 | 
 Then:
 - Run `claude` once on each machine to log in.
 - **Tailscale admin console:** disable key expiry for each host, and set the SSH rule once (see [Tailscale](#tailscale-admin-console-once)).
-- On the Mac: run the same command again after setting up a new host. It finds the host on Tailscale and adds it to herdr.
+- On the Mac: run the same command again after setting up a new host. It finds the host on Tailscale and adds it to hc (`hc machine add --install`, which also copies hc there), so it shows in the Herdr app.
 
 What it decides for you:
 
@@ -78,7 +79,7 @@ Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -
 |---|---|---|
 | `install.sh`, `install.ps1` | everywhere / Windows | The one-line installers above |
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
-| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, and the keepalive, watchdog, shutdown and snapshot tasks |
+| `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks |
 | `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
 
@@ -93,12 +94,16 @@ Gigabyte AORUS AM4:
 
 ### What the Windows installer does
 `install.ps1` downloads agent-box to `%USERPROFILE%\agent-box` and runs `windows\setup.ps1 -Install`, which sets:
-- sleep on AC power to never
-- Wi-Fi adapter never powered off to save power
-- WSL memory capped at your RAM minus 4GB (WSL only takes what it uses; switch agents off before games)
+- sleep on AC power to never (see [Sleep when idle](#sleep-when-idle-opt-in) for the opt-in alternative)
+- Wi-Fi adapter never powered off to save power; its Wake on Magic Packet / WoWLAN settings and "allow this device to wake the computer" on, where the driver has them (it prints what it found and the MAC address)
+- WSL memory capped at your RAM minus 4GB, plus 8–16GB swap (WSL only takes what it uses; switch agents off before games). `-WslMemoryGB` and `-WslSwapGB` override them.
+- **Tailscale for Windows** (winget) as `pc-win` (the WSL host's name plus `-win`), in unattended mode so it runs before anyone logs in
+- **OpenSSH Server**: keys only, PowerShell as the shell, port 22 open only to Tailscale and the local network (detected; `-LanSubnet` overrides). The keys are those of every agent-box machine, taken from `github.com/<you>.keys` (each machine uploads its own; see [GitHub](#github)) and written to `C:\ProgramData\ssh\administrators_authorized_keys`, the file Windows reads for administrators.
 - Fast Startup off, so startup tasks run and **Agents off** ends when the PC is turned off
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
+- a **WSL watchdog** task (every 3 min): if `wsl -d Ubuntu -- true` doesn't answer within 30 s twice in a row, it runs `wsl --shutdown` and starts the keepalive again; if tailscaled inside WSL is down twice in a row, it restarts it. It does nothing while **Agents off** is on or a snapshot runs.
+- a **power events** task (at boot and hourly) that copies sleep, wake (with its source), shutdown, unexpected-reboot and crash events (Kernel-Power 41/42/107, 1074, 6005/6006/6008, bugchecks) to `C:\ProgramData\agent-box\power-events.log`
 - a **remote shutdown** task that turns Windows off after `agent-box off`, or restarts it after `agent-box restart` (checks every minute)
 - **Agents off** and **Agents on** shortcuts on the desktop (see [Games](#games-on-the-windows-pc))
 - a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. To change it, run `windows\setup.ps1 -Install -BackupDir D:\wsl-backups -BackupKeep 5`.
@@ -109,28 +114,57 @@ If WSL isn't installed yet, it installs Ubuntu and stops. Reboot, open Ubuntu on
 
 Also check these by hand:
 - **BitLocker / Device Encryption:** TPM-only, no PIN.
-- **Windows Tailscale:** not needed. If it's installed under the same name as WSL, rename or remove it so they don't clash.
+- **Tailscale admin console:** disable key expiry for `pc-win` too.
+
+The watchdogs and the idle-sleep task log what they do, with timestamps, to `C:\ProgramData\agent-box\agent-box.log`.
+
+### Getting in when WSL is down
+From the Mac, add the Windows user once to `~/.ssh/config` (the installer prints it):
+```
+Host pc-win
+    User <your Windows user>
+```
+Then `ssh pc-win` opens PowerShell on Windows:
+```powershell
+wsl --shutdown                                          # stop a hung WSL
+Start-ScheduledTask 'agent-box WSL keepalive'           # start it again
+Get-Content C:\ProgramData\agent-box\agent-box.log -Tail 30       # what the watchdogs did
+Get-Content C:\ProgramData\agent-box\power-events.log -Tail 30    # sleep, wake, shutdown, crashes
+Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 41, 42, 107, 1074, 6008 } -MaxEvents 20 |
+    Format-Table TimeCreated, Id, Message -Wrap
+Restart-Computer                                        # last resort
+```
+
+### Sleep when idle (opt-in)
+Off by default: the PC never sleeps. `windows\setup.ps1 -Install -SleepWhenIdle on [-IdleMinutes 30]` (saved for later runs; `-SleepWhenIdle off` undoes it) adds a task that every 10 minutes asks WSL (`agent-box _busy`) whether a CI job (`Runner.Worker`) runs, a Claude agent is working (uses CPU), or the load is high. When nothing is, nobody is logged in to Windows and no SSH session to Windows is open, for `IdleMinutes`, it sleeps (S3; hibernation is turned off in this mode, and the Wi-Fi adapter may power down so it can wake the PC).
+
+It then wakes only from the network: `ether-wake -i br0 <Wi-Fi MAC>` on the router. Wake-on-LAN over Wi-Fi depends on the driver and the router and isn't verified yet, so test it before relying on it: with the mode on, run `rundll32.exe powrprof.dll,SetSuspendState 0,1,0` on the PC, then `ether-wake` from the router. `powercfg /a` must list "Standby (S3)".
 
 ### Games on the Windows PC
-Before a game, double-click **Agents off** on the desktop. It stops WSL and everything in it (agents, herdr, CI runners) and gives its memory back to Windows. The PC then drops out of herdr, and CI jobs for it wait in the queue.
+Before a game, double-click **Agents off** on the desktop. It stops WSL and everything in it (agents, hc, CI runners) and gives its memory back to Windows. The PC then shows as offline in the Herdr app, and CI jobs for it wait in the queue.
 
 Agents come back with **Agents on**, or by themselves the next time the PC is turned on. Claude conversations that were running can be continued with `claude --resume`.
 
 ### What the Linux install does on a host
 - `/etc/wsl.conf` on WSL: systemd on, Windows drives hidden from agents
 - Tailscale with **Tailscale SSH** (opens a login link the first time)
-- herdr, plus its server as a systemd user service with linger, so it runs without a login
-- Claude Code, the herdr ↔ Claude integration, and the sandbox dependencies (`bubblewrap`, `socat`)
+- what hc needs: linger, so hc's core and its terminals keep running after the last SSH login closes, and `claude` on the login shell's PATH (hc starts programs with the login environment). hc itself arrives from the Mac (`hc machine add --install`); its core runs as a systemd user service the app starts over SSH
+- the user's systemd manager (`user@<uid>.service`, where hc's core, its terminals, agents and their builds run) capped at 60% (throttled) / 70% (hard limit) of memory, so they can't take the host down
+- the old herdr TUI removed if an earlier agent-box installed it: its server unit, binary, `~/.config/herdr` and its Claude hook. hc and its folders are left alone
+- tailscaled restarted after any crash (`Restart=always`, no start limit) and protected from the OOM killer
+- **earlyoom**: when memory runs low, it kills one build or test process (`node`, `vitest`, `jest`, `workerd`, `python`, `Runner.Worker`), never tailscaled, sshd, hc (`herdr-core`) or systemd
+- self-hosted GitHub runners (`gh-runner*`, `actions.runner*` services), if there are any: moved into their own slice with at most 50% of memory and a lower CPU weight than agents. It never creates or removes runners, and restarts them only when no job runs.
+- Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
 - Proton Pass CLI, this machine's Proton Pass token (asked once) and the `pp` wrapper
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
-On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` and a herdr machine per host. A host must be on for the Mac to add it.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` and an hc machine per host, which the Herdr app shows. A host must be on for the Mac to add it.
 
 ## Tailscale admin console (once)
 - **Machines → each host → Disable key expiry**
-- **Access controls:** make Tailscale SSH accept logins without browser re-checks. herdr reconnects in the background, so `check` mode would break it:
+- **Access controls:** make Tailscale SSH accept logins without browser re-checks. The Herdr app reconnects in the background, so `check` mode would break it:
   ```json
   "ssh": [
     { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self"], "users": ["autogroup:nonroot"] }
@@ -140,7 +174,7 @@ On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, 
 
 ## Raspberry Pi (or another Linux host)
 
-Any Linux machine can be a host that works exactly like the PC. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and herdr have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
+Any Linux machine can be a host that works exactly like the PC. It needs a **64-bit OS** (Raspberry Pi OS 64-bit on a Pi 3, 4 or 5); Claude Code and hc have no 32-bit ARM builds. 4 GB RAM or more is comfortable for a few agents.
 
 Run the one-line install on it. Or, if you'd rather not touch the Pi, turn SSH on (Raspberry Pi Imager → *Enable SSH*, or `sudo raspi-config` → Interface Options → SSH) and run from the Mac:
 ```bash
@@ -154,8 +188,8 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 
 | You want to | Do this |
 |---|---|
-| Start | Press the power button. **pc** comes online in herdr in about 1–2 min. |
-| Work | Open panes under **pc** in herdr on the Mac. Agents keep running when the Mac closes. |
+| Start | Press the power button. **pc** comes online in the Herdr app in about 1–2 min. |
+| Work | Open spaces on **pc** in the Herdr app on the Mac. Agents keep running when the Mac closes. |
 | Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. `agent-box off pi` for the Pi. |
 | Restart | `agent-box restart` from the Mac (Windows restarts within ~2 min and comes back on its own). |
 | Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
@@ -165,7 +199,7 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 
 ## Rex on the Mac
 
-[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Agents run on the Mac only; hosts such as **pc** stay in herdr.
+[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Agents run on the Mac only; hosts such as **pc** stay in the Herdr app.
 
 Claude Code reports its state to Rex itself (Program Status Protocol), so tabs show a spinner while an agent works and the session picker marks agents that are blocked or done. The pieces on top:
 
@@ -178,7 +212,7 @@ Claude Code reports its state to Rex itself (Program Status Protocol), so tabs s
 
 All four are also in the command palette under **Agents**. A shortcut recorded in the app with **Change Shortcut…** overrides these.
 
-From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside herdr, `herdr-placement` applies instead.
+From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside the Herdr app, `herdr-placement` applies instead.
 
 Turn on **Remote Control** in Rex's settings (Rex Server) so commands run from a terminal, like `rex-task` or a history resume, can switch the app to the new session. Keys work without it.
 
@@ -210,7 +244,7 @@ Each machine has exactly one Proton Pass login, shared by `pp` (agent-box) and e
 
 - **One token per machine:** a scoped personal access token that sees only the vaults that machine needs, is read-only by default, and logs every read with a reason.
 - **One session:** pass-cli's default session directory. Nothing sets `PROTON_PASS_SESSION_DIR`; if you export it yourself, it is respected.
-- **One local key (Linux, WSL):** pass-cli encrypts its session with a local key. By default it keeps that key in the kernel keyring, which is separate for every login session, so herdr panes and SSH logins would fight over the one session (`file is not a database`). agent-box sets `PROTON_PASS_KEY_PROVIDER=fs` in the login profile and in `pp`, so pass-cli keeps the key in a file instead. macOS keeps the Keychain.
+- **One local key (Linux, WSL):** pass-cli encrypts its session with a local key. By default it keeps that key in the kernel keyring, which is separate for every login session, so hc terminals and SSH logins would fight over the one session (`file is not a database`). agent-box sets `PROTON_PASS_KEY_PROVIDER=fs` in the login profile and in `pp`, so pass-cli keeps the key in a file instead. macOS keeps the Keychain.
 
 | | Session (pass-cli default) | Token |
 |---|---|---|
@@ -263,12 +297,12 @@ Then set your default user again in WSL (`/etc/wsl.conf` → `[user]` `default=<
 
 ## Acceptance test
 
-Repeat 5–10 times: shut the PC down, press the power button, don't touch it. It passes if **pc** comes online in herdr on your Mac every time and you can open a pane and run `claude`.
+Repeat 5–10 times: shut the PC down, press the power button, don't touch it. It passes if **pc** comes online in the Herdr app on your Mac every time and you can open a space on it and run `claude`.
 
 If it doesn't come online:
-1. Is the `WSL keepalive` task running? (Task Scheduler on Windows)
-2. Inside WSL: `agent-box` (check mode) and `systemctl --user status herdr`
-3. On the Mac: `herdr machine status pc` and `ssh pc true`
+1. `ssh pc-win`: is Windows up? Read `agent-box.log` and `power-events.log` (see [Getting in when WSL is down](#getting-in-when-wsl-is-down)), and check that the `WSL keepalive` task is running.
+2. Inside WSL: `agent-box` (check mode) and `hc server status`
+3. On the Mac: `hc machine ls` and `ssh pc true`
 
 ## Known limits
 
@@ -278,3 +312,5 @@ If it doesn't come online:
 - If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and run the Windows one-liner again.
 - `wsl --export` of a running distro and the shutdown task's call into WSL are untested on a real PC. Check Task Scheduler's "Last Run Result" after the first week.
 - Snapshots are full copies of Ubuntu and can be large. Point `-BackupDir` at a drive with room.
+- Windows Tailscale and SSH, the WSL watchdog, the power events log, the Wi-Fi wake settings and sleep when idle are written from the documentation and haven't run on the PC yet.
+- On the very first install the Windows SSH keys are skipped, because they come from `gh` inside WSL, which isn't set up yet. Run the Windows one-liner again afterwards, or pass `-GitHubUser <login>`.
