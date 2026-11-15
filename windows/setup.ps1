@@ -5,6 +5,7 @@
 #
 # Options: -Distro Ubuntu  -WslMemoryGB <n>  -WslSwapGB <n>  -BackupDir <path>  -BackupKeep <n>
 #          -AgentHost <name>  -GitHubUser <login>  -LanSubnet <a.b.c.d/n>
+#          -SleepWhenIdle on|off  -IdleMinutes <n>   (these two are saved for later runs)
 #
 # Run from an administrator PowerShell. Written for Windows PowerShell 5.1.
 
@@ -17,7 +18,9 @@ param(
     [int]$BackupKeep = 3,
     [string]$AgentHost = "",
     [string]$GitHubUser = "",
-    [string]$LanSubnet = ""
+    [string]$LanSubnet = "",
+    [ValidateSet("", "on", "off")][string]$SleepWhenIdle = "",
+    [int]$IdleMinutes = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,11 +32,20 @@ $BackupPath    = Join-Path $DataDir "backup.ps1"
 $KeepalivePath = Join-Path $DataDir "keepalive.ps1"
 $AgentsOffPath = Join-Path $DataDir "agents-off.ps1"
 $AgentsOnPath  = Join-Path $DataDir "agents-on.ps1"
+$WslWatchdogPath = Join-Path $DataDir "wsl-watchdog.ps1"
+$PowerLogPath  = Join-Path $DataDir "power-log.ps1"
+$IdleSleepPath = Join-Path $DataDir "idle-sleep.ps1"
+$ActionLog     = Join-Path $DataDir "agent-box.log"
+$PowerEventsLog = Join-Path $DataDir "power-events.log"
+$SettingsFile  = Join-Path $DataDir "config"
 $PausedFlag    = Join-Path $env:LOCALAPPDATA "agent-box\paused"
 $WatchdogTask  = "agent-box net watchdog"
 $KeepaliveTask = "agent-box WSL keepalive"
 $ShutdownTask  = "agent-box remote shutdown"
 $BackupTask    = "agent-box WSL snapshot"
+$WslWatchdogTask = "agent-box WSL watchdog"
+$PowerLogTask  = "agent-box power events log"
+$IdleSleepTask = "agent-box idle sleep"
 $SshdConfig    = Join-Path $env:ProgramData "ssh\sshd_config"
 $AdminKeys     = Join-Path $env:ProgramData "ssh\administrators_authorized_keys"
 $TailscaleExe  = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
@@ -116,6 +128,18 @@ function Invoke-Quiet([scriptblock]$Block) {
     $ErrorActionPreference = "Continue"
     & $Block 2>$null
 }
+
+# -SleepWhenIdle and -IdleMinutes are kept in $SettingsFile, so a later run of the
+# one-line installer (which passes no options) doesn't switch them back.
+function Get-SavedSetting([string]$Name) {
+    if (-not (Test-Path $SettingsFile)) { return "" }
+    $line = Get-Content $SettingsFile | Where-Object { $_ -like "$Name=*" } | Select-Object -Last 1
+    if ($line) { $line.Substring($Name.Length + 1).Trim() } else { "" }
+}
+if (-not $SleepWhenIdle) { $SleepWhenIdle = Get-SavedSetting "SleepWhenIdle" }
+if ($SleepWhenIdle -ne "on") { $SleepWhenIdle = "off" }
+if ($IdleMinutes -le 0) { $IdleMinutes = [int](Get-SavedSetting "IdleMinutes") }
+if ($IdleMinutes -le 0) { $IdleMinutes = 30 }
 
 # IPv4 network of the interface holding the default route, e.g. 192.168.1.0/24.
 function Get-LocalSubnet {
@@ -207,15 +231,80 @@ Step "Sleep on AC power: never" {
     powercfg /change hibernate-timeout-ac 0
 }
 
+# With -SleepWhenIdle on, the idle-sleep task decides when to sleep. SetSuspendState
+# hibernates instead of sleeping while hibernation is on, and a hibernated PC can't
+# be woken over the network.
+if ($SleepWhenIdle -eq "on") {
+    Step "Hibernation off (sleep when idle uses S3 sleep)" {
+        (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Power" -Name HibernateEnabled -ErrorAction SilentlyContinue).HibernateEnabled -eq 0
+    } {
+        powercfg /hibernate off
+    }
+}
+
 $wifi = Get-WifiAdapter
 if ($wifi) {
     # "Allow the computer to turn off this device" in Device Manager. Set-NetAdapterPowerManagement
     # can't change it, so this goes through the same WMI setting the checkbox uses.
-    Step "Wi-Fi adapter '$($wifi.Name)' never powered off to save power" {
-        $p = Get-WifiPowerSetting $wifi
-        (-not $p) -or (-not $p.Enable)
-    } {
-        Set-CimInstance -InputObject (Get-WifiPowerSetting $wifi) -Property @{ Enable = $false }
+    # Windows only lets a device wake the PC while that box is ticked, so sleep when idle
+    # needs it on; otherwise it stays off, which keeps Wi-Fi from dropping out.
+    if ($SleepWhenIdle -eq "on") {
+        Step "Wi-Fi adapter '$($wifi.Name)' may power down while the PC sleeps (to wake it)" {
+            $p = Get-WifiPowerSetting $wifi
+            (-not $p) -or $p.Enable
+        } {
+            Set-CimInstance -InputObject (Get-WifiPowerSetting $wifi) -Property @{ Enable = $true }
+        }
+    } else {
+        Step "Wi-Fi adapter '$($wifi.Name)' never powered off to save power" {
+            $p = Get-WifiPowerSetting $wifi
+            (-not $p) -or (-not $p.Enable)
+        } {
+            Set-CimInstance -InputObject (Get-WifiPowerSetting $wifi) -Property @{ Enable = $false }
+        }
+    }
+
+    # Wake-on-LAN over Wi-Fi: the driver's own settings, then Windows' permission to wake.
+    # Drivers name them differently and many have none; "Wake on Pattern Match" is left
+    # alone because it wakes the PC on ordinary traffic.
+    $onValue = '^(Enabled|On)$'
+    $wakeProps = @(Get-NetAdapterAdvancedProperty -Name $wifi.Name -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match 'Magic Packet|WoWLAN|Wake on WLAN' -and ($_.ValidDisplayValues -match $onValue) })
+    $wakePm = Get-NetAdapterPowerManagement -Name $wifi.Name -ErrorAction SilentlyContinue
+    $magicPm = $wakePm -and ("$($wakePm.WakeOnMagicPacket)" -notin @("", "Unsupported"))
+    $found = @($wakeProps | ForEach-Object { "$($_.DisplayName) = $($_.DisplayValue)" })
+    if ($magicPm) { $found += "power management Wake on Magic Packet = $($wakePm.WakeOnMagicPacket)" }
+    if ($found.Count -gt 0) {
+        Write-Info ("Wi-Fi wake settings found: " + ($found -join "; "))
+        Step "Wi-Fi Wake on Magic Packet / WoWLAN on" {
+            $names = @($wakeProps | ForEach-Object { $_.DisplayName })
+            $off = @(Get-NetAdapterAdvancedProperty -Name $wifi.Name |
+                Where-Object { $names -contains $_.DisplayName -and $_.DisplayValue -notmatch $onValue })
+            ($off.Count -eq 0) -and
+                ((-not $magicPm) -or "$((Get-NetAdapterPowerManagement -Name $wifi.Name).WakeOnMagicPacket)" -eq "Enabled")
+        } {
+            foreach ($p in $wakeProps) {
+                $on = $p.ValidDisplayValues | Where-Object { $_ -match $onValue } | Select-Object -First 1
+                Set-NetAdapterAdvancedProperty -Name $wifi.Name -DisplayName $p.DisplayName -DisplayValue $on
+            }
+            if ($magicPm) { Set-NetAdapterPowerManagement -Name $wifi.Name -WakeOnMagicPacket Enabled }
+        }
+    } else {
+        Write-Info "the Wi-Fi driver has no Wake on Magic Packet or WoWLAN setting"
+    }
+
+    # "Allow this device to wake the computer" in Device Manager.
+    $wifiDevice = (Get-PnpDevice -InstanceId $wifi.PnPDeviceID -ErrorAction SilentlyContinue).FriendlyName
+    $canWake = $wifiDevice -and (@(powercfg /devicequery wake_programmable | ForEach-Object { $_.Trim() }) -contains $wifiDevice)
+    if ($canWake) {
+        Step "Wi-Fi adapter may wake the computer" {
+            @(powercfg /devicequery wake_armed | ForEach-Object { $_.Trim() }) -contains $wifiDevice
+        } {
+            powercfg /deviceenablewake "$wifiDevice"
+        }
+        Write-Info "Wake-on-LAN from the router: ether-wake -i br0 $($wifi.MacAddress -replace '-', ':')"
+    } else {
+        Write-Info "Windows doesn't list '$wifiDevice' as able to wake the computer"
     }
 } else {
     Write-Info "no Wi-Fi adapter found; skipping Wi-Fi checks"
@@ -407,11 +496,11 @@ function New-BootAndRepeatTriggers([int]$Minutes) {
     )
 }
 # Windows checks the password when the task is registered; a wrong one is asked again.
-function Register-UserTask([string]$Name, $Action, $Triggers, $Settings) {
+function Register-UserTask([string]$Name, $Action, $Triggers, $Settings, [string]$RunLevel = "Limited") {
     for ($try = 1; ; $try++) {
         try {
             Register-ScheduledTask -TaskName $Name -Action $Action -Trigger $Triggers -Settings $Settings `
-                -User $TaskUser -Password (Get-TaskPassword) -Force -ErrorAction Stop | Out-Null
+                -User $TaskUser -Password (Get-TaskPassword) -RunLevel $RunLevel -Force -ErrorAction Stop | Out-Null
             return
         } catch {
             $badPassword = $_.Exception.HResult -eq -2147023570 -or $_.Exception.Message -match 'password'
@@ -425,6 +514,7 @@ function Register-UserTask([string]$Name, $Action, $Triggers, $Settings) {
 $watchdogBody = @"
 # Managed by agent-box. Resets Wi-Fi when the internet is unreachable.
 if (-not (Test-Connection 1.1.1.1 -Count 2 -Quiet)) {
+    Add-Content -Path '$ActionLog' -Value ((Get-Date -Format 's') + '  net watchdog: internet unreachable, resetting Wi-Fi')
     Get-NetAdapter -Physical | Where-Object { `$_.PhysicalMediaType -match '802\.11' } |
         Restart-NetAdapter -Confirm:`$false
 }
@@ -556,6 +646,181 @@ Step "Weekly WSL snapshot to $BackupDir (keeps $BackupKeep)" {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 4)
     Register-UserTask $BackupTask (New-ScriptAction $BackupPath) $trigger $settings
+}
+
+# Shared by the task scripts below: wsl.exe calls that can't hang the task (exit
+# code -1 on timeout), and the action log with one rotation at 1 MB.
+$taskHelpers = @"
+function Invoke-Wsl([string]`$Arguments, [int]`$Seconds) {
+    `$psi = New-Object Diagnostics.ProcessStartInfo 'wsl.exe', `$Arguments
+    `$psi.UseShellExecute = `$false
+    `$psi.CreateNoWindow = `$true
+    `$psi.RedirectStandardOutput = `$true
+    `$p = [Diagnostics.Process]::Start(`$psi)
+    `$out = `$p.StandardOutput.ReadToEndAsync()
+    if (-not `$p.WaitForExit(`$Seconds * 1000)) {
+        try { `$p.Kill() } catch { }
+        return @{ Code = -1; Output = '' }
+    }
+    @{ Code = `$p.ExitCode; Output = "`$(`$out.Result)".Trim() }
+}
+function Write-Log([string]`$Message) {
+    `$log = '$ActionLog'
+    if ((Test-Path `$log) -and (Get-Item `$log).Length -gt 1MB) { Move-Item `$log "`$log.old" -Force }
+    Add-Content -Path `$log -Value ((Get-Date -Format 's') + '  ' + `$Message)
+}
+"@
+
+# The keepalive only restarts WSL after it exits. This one catches a WSL that still
+# runs but no longer answers (out of memory, stuck), and a tailscaled inside it that
+# is down, which takes the host off the tailnet.
+$wslWatchdogBody = @"
+# Managed by agent-box. Restarts WSL when it stops answering, and tailscaled in it when that is down.
+$pausedCheck
+# A snapshot export keeps WSL busy for a long time.
+if ("`$((Get-ScheduledTask -TaskName '$BackupTask' -ErrorAction SilentlyContinue).State)" -eq 'Running') { exit 0 }
+$taskHelpers
+function Get-Strikes([string]`$Name) { [int](Get-Content (Join-Path '$DataDir' "`$Name.strikes") -ErrorAction SilentlyContinue) }
+function Set-Strikes([string]`$Name, [int]`$Count) {
+    `$file = Join-Path '$DataDir' "`$Name.strikes"
+    if (`$Count -eq 0) { Remove-Item `$file -Force -ErrorAction SilentlyContinue } else { Set-Content `$file `$Count }
+}
+
+if ((Invoke-Wsl '-d $Distro --cd ~ --exec true' 30).Code -eq -1) {
+    `$strikes = (Get-Strikes 'wsl') + 1
+    Write-Log "WSL watchdog: WSL did not answer within 30 s (`$strikes in a row)"
+    if (`$strikes -lt 2) { Set-Strikes 'wsl' `$strikes; exit 0 }
+    Set-Strikes 'wsl' 0
+    Write-Log 'WSL watchdog: restarting WSL (wsl --shutdown, then the keepalive task)'
+    Stop-ScheduledTask -TaskName '$KeepaliveTask' -ErrorAction SilentlyContinue
+    if ((Invoke-Wsl '--shutdown' 120).Code -ne 0) {
+        Write-Log 'WSL watchdog: wsl --shutdown did not finish; stopping the WSL processes'
+        Stop-Process -Name wslservice, wslhost, wsl -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 5
+    Start-ScheduledTask -TaskName '$KeepaliveTask'
+    exit 0
+}
+Set-Strikes 'wsl' 0
+
+# 10: tailscaled stopped, 11: it runs but Tailscale isn't up. One restart per outage.
+`$ts = (Invoke-Wsl '-d $Distro -u root --cd ~ --exec sh -c "systemctl is-enabled --quiet tailscaled || exit 0; systemctl is-active --quiet tailscaled || exit 10; tailscale status >/dev/null 2>&1 || exit 11"' 30).Code
+if (`$ts -eq 10 -or `$ts -eq 11) {
+    `$strikes = (Get-Strikes 'tailscale') + 1
+    Set-Strikes 'tailscale' `$strikes
+    if (`$strikes -eq 2) {
+        Write-Log "WSL watchdog: Tailscale in WSL down twice in a row (`$ts); restarting tailscaled"
+        Invoke-Wsl '-d $Distro -u root --cd ~ --exec systemctl restart tailscaled' 60 | Out-Null
+    } elseif (`$strikes -eq 3) {
+        Write-Log 'WSL watchdog: Tailscale in WSL still down after a restart; it may need sudo tailscale up'
+    }
+} elseif (`$ts -eq 0) {
+    Set-Strikes 'tailscale' 0
+}
+"@
+
+Step "WSL watchdog task (restarts a hung WSL, every 3 min)" {
+    (Test-ManagedScript $WslWatchdogPath $wslWatchdogBody) -and (Test-Task $WslWatchdogTask)
+} {
+    Write-ManagedScript $WslWatchdogPath $wslWatchdogBody
+    if (-not (Test-Task $WslWatchdogTask)) {
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+        # Highest, so it can stop the WSL service when wsl --shutdown hangs too.
+        Register-UserTask $WslWatchdogTask (New-ScriptAction $WslWatchdogPath) (New-BootAndRepeatTriggers 3) $settings "Highest"
+    }
+}
+
+# Sleep, wake (with its source), shutdown, unexpected reboot and crash events, so
+# the next time the PC disappears the log says how.
+$powerLogBody = @"
+# Managed by agent-box. Appends sleep, wake, shutdown and crash events to $PowerEventsLog.
+`$log = '$PowerEventsLog'
+`$last = '$PowerEventsLog.last'
+`$since = (Get-Date).AddDays(-30)
+if (Test-Path `$last) { `$since = [datetime]::Parse((Get-Content `$last -Raw).Trim(), `$null, 'RoundtripKind') }
+`$filter = @{ LogName = 'System'; Id = 1, 41, 42, 107, 1001, 1074, 6005, 6006, 6008; StartTime = `$since }
+`$events = @(Get-WinEvent -FilterHashtable `$filter -ErrorAction SilentlyContinue |
+    Where-Object { `$_.TimeCreated -gt `$since -and `$_.ProviderName -match 'Kernel-Power|User32|EventLog|Power-Troubleshooter|WER-SystemErrorReporting' } |
+    Sort-Object TimeCreated)
+foreach (`$e in `$events) {
+    `$text = ("`$(`$e.Message)" -replace '\s+', ' ').Trim()
+    if (`$text.Length -gt 300) { `$text = `$text.Substring(0, 300) }
+    `$source = `$e.ProviderName -replace '^Microsoft-Windows-', ''
+    Add-Content -Path `$log -Value (`$e.TimeCreated.ToString('s') + '  ' + `$source + ' ' + `$e.Id + '  ' + `$text)
+}
+if (`$events.Count -gt 0) { Set-Content -Path `$last -Value `$events[-1].TimeCreated.ToString('o') }
+"@
+
+Step "Power events log task ($PowerEventsLog, boot + hourly)" {
+    (Test-ManagedScript $PowerLogPath $powerLogBody) -and (Test-Task $PowerLogTask)
+} {
+    Write-ManagedScript $PowerLogPath $powerLogBody
+    $triggers = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1))
+    )
+    Register-ScheduledTask -TaskName $PowerLogTask -Action (New-ScriptAction $PowerLogPath) `
+        -Trigger $triggers -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+}
+
+# Opt-in (-SleepWhenIdle on): Wake-on-LAN over Wi-Fi isn't proven yet, and a PC that
+# sleeps without waking is gone until someone presses the button. It only sleeps
+# when agents are on, nobody is logged in to Windows or connected over SSH, and WSL
+# reports no CI job, no working Claude and no heavy load (agent-box _busy).
+$idleSleepBody = @"
+# Managed by agent-box. Puts the PC to sleep (S3) after $IdleMinutes idle minutes.
+$pausedCheck
+$taskHelpers
+`$since = '$DataDir\idle-since'
+function Get-BusyReason {
+    if (Get-Process explorer -ErrorAction SilentlyContinue) { return 'someone is logged in to Windows' }
+    if (@(Get-Process sshd, sshd-session -ErrorAction SilentlyContinue).Count -gt 1) { return 'an SSH session to Windows is open' }
+    `$r = Invoke-Wsl '-d $Distro --cd ~ --exec bash -lc "agent-box _busy"' 60
+    if (`$r.Code -eq 0) { return "WSL: `$(`$r.Output)" }
+    if (`$r.Code -ne 1) { return "WSL did not answer (exit `$(`$r.Code))" }
+    `$null
+}
+`$reason = Get-BusyReason
+if (`$reason) {
+    if (Test-Path `$since) { Write-Log "idle sleep: busy again (`$reason)" }
+    Remove-Item `$since -Force -ErrorAction SilentlyContinue
+    exit 0
+}
+if (-not (Test-Path `$since)) {
+    Set-Content `$since (Get-Date -Format o)
+    Write-Log 'idle sleep: nothing running; sleeping if it stays so for $IdleMinutes min'
+    exit 0
+}
+`$idle = (Get-Date) - [datetime]::Parse((Get-Content `$since -Raw).Trim(), `$null, 'RoundtripKind')
+if (`$idle.TotalMinutes -lt $IdleMinutes) { exit 0 }
+Remove-Item `$since -Force
+Write-Log "idle sleep: idle for `$([int]`$idle.TotalMinutes) min, going to sleep"
+& rundll32.exe 'powrprof.dll,SetSuspendState' '0,1,0'
+"@
+
+if ($SleepWhenIdle -eq "on") {
+    Step "Idle sleep task (sleeps after $IdleMinutes idle minutes, checks every 10 min)" {
+        (Test-ManagedScript $IdleSleepPath $idleSleepBody) -and (Test-Task $IdleSleepTask)
+    } {
+        Write-ManagedScript $IdleSleepPath $idleSleepBody
+        if (-not (Test-Task $IdleSleepTask)) {
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+            Register-UserTask $IdleSleepTask (New-ScriptAction $IdleSleepPath) (New-BootAndRepeatTriggers 10) $settings "Highest"
+        }
+    }
+    $script:Notes.Add("Sleep when idle is on: test that 'ether-wake' from the router wakes the PC (README -> Sleep when idle).")
+} else {
+    Step "No idle sleep task (sleep when idle is off)" { -not (Test-Task $IdleSleepTask) } {
+        Unregister-ScheduledTask -TaskName $IdleSleepTask -Confirm:$false
+        Remove-Item $IdleSleepPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$settingsBody = "# Managed by agent-box.`r`nSleepWhenIdle=$SleepWhenIdle`r`nIdleMinutes=$IdleMinutes"
+Step "Settings saved to $SettingsFile" { Test-ManagedScript $SettingsFile $settingsBody } {
+    Write-ManagedScript $SettingsFile $settingsBody
 }
 
 Write-Host ""
