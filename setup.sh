@@ -723,6 +723,34 @@ install_tailscale() {
 check_tailscaled() { systemctl is-enabled tailscaled >/dev/null 2>&1 && systemctl is-active tailscaled >/dev/null 2>&1; }
 install_tailscaled() { sudo systemctl enable --now tailscaled; }
 
+# write_root_file <path> <content>, for files under /etc; file_is <path> <content>.
+write_root_file() { sudo mkdir -p "$(dirname "$1")" && printf '%s\n' "$2" | sudo tee "$1" >/dev/null; }
+file_is() { [ -f "$1" ] && [ "$(cat "$1")" = "$2" ]; }
+
+# On WSL, tailscaled is the only way in from the tailnet, so it comes back after
+# any exit, never gives up restarting, and is the last thing the kernel kills.
+TAILSCALED_DROPIN=/etc/systemd/system/tailscaled.service.d/agent-box.conf
+tailscaled_dropin() {
+  cat <<'EOF'
+# Managed by agent-box.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+EOF
+}
+check_tailscaled_restart() {
+  file_is "$TAILSCALED_DROPIN" "$(tailscaled_dropin)" \
+    && [ "$(systemctl show -p Restart --value tailscaled 2>/dev/null)" = always ]
+}
+install_tailscaled_restart() {
+  write_root_file "$TAILSCALED_DROPIN" "$(tailscaled_dropin)" && sudo systemctl daemon-reload || return 1
+  info "OOMScoreAdjust applies the next time tailscaled starts"
+}
+
 ts_running() { [ "$(tailscale status --json 2>/dev/null | jq -r .BackendState)" = Running ]; }
 ts_prefs() { tailscale debug prefs 2>/dev/null || sudo -n tailscale debug prefs 2>/dev/null; }
 
@@ -774,6 +802,10 @@ Description=Herdr server (agent-box)
 [Service]
 ExecStart=$(command -v herdr) server
 Restart=on-failure
+# Agents and their builds share the machine with other services (CI runners);
+# throttle them before the whole host runs out of memory and stops answering.
+MemoryHigh=60%
+MemoryMax=70%
 
 [Install]
 WantedBy=default.target
@@ -788,11 +820,131 @@ install_herdr_service() {
   have herdr || return 1
   mkdir -p "$(dirname "$HERDR_UNIT")"
   herdr_unit > "$HERDR_UNIT"
-  systemctl --user daemon-reload && systemctl --user enable --now herdr
+  systemctl --user daemon-reload && systemctl --user enable --now herdr || return 1
+  # A running server gets the memory limits now instead of at its next start.
+  systemctl --user set-property --runtime herdr.service MemoryHigh=60% MemoryMax=70%
 }
 
 check_linger() { loginctl show-user "$USER" -p Linger 2>/dev/null | grep 'Linger=yes' >/dev/null; }
 install_linger() { sudo loginctl enable-linger "$USER"; }
+
+# ---------------------------------------------------------------- memory
+
+# earlyoom acts before the kernel's OOM killer would stall the machine: it kills
+# one build or test process (node, vitest, workerd, a CI job) and leaves
+# tailscaled, sshd, herdr and systemd alone. The names are matched against the
+# process name; quotes would reach earlyoom literally, so the regexes have none.
+EARLYOOM_DEFAULTS=/etc/default/earlyoom
+earlyoom_defaults() {
+  cat <<'EOF'
+# Managed by agent-box. When memory runs low, kill one build or test process,
+# not the whole machine.
+EARLYOOM_ARGS="-r 3600 --prefer ^(node|vitest|jest|workerd|python|Runner.Worker) --avoid ^(tailscaled|sshd|herdr|systemd|init|earlyoom)"
+EOF
+}
+check_earlyoom() {
+  have earlyoom && file_is "$EARLYOOM_DEFAULTS" "$(earlyoom_defaults)" \
+    && systemctl is-enabled earlyoom >/dev/null 2>&1 && systemctl is-active earlyoom >/dev/null 2>&1
+}
+install_earlyoom() {
+  have earlyoom || apt_install earlyoom || return 1
+  write_root_file "$EARLYOOM_DEFAULTS" "$(earlyoom_defaults)" \
+    && sudo systemctl enable earlyoom && sudo systemctl restart earlyoom
+}
+
+# Self-hosted GitHub runners (set up outside agent-box) run in their own slice
+# with less memory and CPU than agents, so a burst of CI jobs can't take the
+# host down. Runners are only capped, never created or removed.
+RUNNER_SLICE=agent-box-runners.slice
+runner_slice() {
+  cat <<'EOF'
+# Managed by agent-box. CI runners get less memory and CPU than agents.
+[Unit]
+Description=CI runners (agent-box)
+
+[Slice]
+MemoryHigh=45%
+MemoryMax=50%
+CPUWeight=20
+IOWeight=20
+EOF
+}
+runner_dropin() { printf '# Managed by agent-box.\n[Service]\nSlice=%s\n' "$RUNNER_SLICE"; }
+runner_dropin_path() { echo "/etc/systemd/system/$1.d/agent-box-slice.conf"; }
+# Unit files, templates included (a drop-in for gh-runner@.service covers every instance).
+runner_units() {
+  systemctl list-unit-files --type=service --no-legend 'gh-runner*' 'actions.runner*' 2>/dev/null | awk '{ print $1 }'
+}
+active_runners() {
+  systemctl list-units --type=service --state=active --no-legend --plain 'gh-runner*' 'actions.runner*' 2>/dev/null \
+    | awk '{ print $1 }'
+}
+runners_outside_slice() {
+  local u
+  for u in $(active_runners); do
+    [ "$(systemctl show -p Slice --value "$u" 2>/dev/null)" = "$RUNNER_SLICE" ] || echo "$u"
+  done
+}
+check_runner_caps() {
+  local u
+  file_is "/etc/systemd/system/$RUNNER_SLICE" "$(runner_slice)" || return 1
+  for u in $(runner_units); do
+    file_is "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
+  done
+  [ -z "$(runners_outside_slice)" ]
+}
+install_runner_caps() {
+  local u stale
+  write_root_file "/etc/systemd/system/$RUNNER_SLICE" "$(runner_slice)" || return 1
+  for u in $(runner_units); do
+    write_root_file "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
+  done
+  sudo systemctl daemon-reload || return 1
+  stale="$(runners_outside_slice | tr '\n' ' ')"
+  [ -n "$stale" ] || return 0
+  # Moving a service to another slice needs a restart, which would kill a running job.
+  if pgrep -f 'Runner[.]Worker' >/dev/null; then
+    info "a CI job is running; rerun once it's done (or reboot) to restart: $stale"
+    return 1
+  fi
+  # shellcheck disable=SC2086  # one argument per unit
+  sudo systemctl restart $stale
+}
+
+# `agent-box _busy`, asked by the Windows idle-sleep task every 10 minutes: prints
+# what keeps the host busy and succeeds, or fails when nothing does. Claude's CPU
+# time (its own plus its finished children's) is compared with the previous call,
+# so an agent waiting at its prompt doesn't count as working.
+BUSY_STATE="$HOME/.agent-box/claude-cpu"
+BUSY_LOAD=1.0          # 5-minute load average that counts as heavy work
+BUSY_CLAUDE_SECONDS=5  # Claude CPU seconds since the last call that count as working
+claude_cpu() {  # "pid ticks" per claude process
+  local p
+  for p in $(pgrep -x claude); do
+    awk -v p="$p" '{ print p, $14 + $15 + $16 + $17 }' "/proc/$p/stat" 2>/dev/null
+  done
+}
+host_busy() {
+  local load now secs
+  if pgrep -f 'Runner[.]Worker' >/dev/null; then echo "CI job running"; return 0; fi
+  load="$(cut -d' ' -f2 /proc/loadavg)"
+  if awk -v l="$load" -v m="$BUSY_LOAD" 'BEGIN { exit !(l >= m) }'; then
+    echo "load average $load"
+    return 0
+  fi
+  now="$(claude_cpu)"
+  secs="$({ sed 's/^/old /' "$BUSY_STATE" 2>/dev/null; printf '%s\n' "$now" | sed 's/^/new /'; } \
+    | awk -v hz="$(getconf CLK_TCK)" '
+        $1 == "old" { was[$2] = $3 }
+        $1 == "new" && NF == 3 { d += $3 - was[$2] }
+        END { printf "%d", d / hz }')"
+  mkdir -p "$(dirname "$BUSY_STATE")" && printf '%s\n' "$now" > "$BUSY_STATE"
+  if [ "${secs:-0}" -ge "$BUSY_CLAUDE_SECONDS" ]; then
+    echo "Claude working (${secs}s CPU since the last check)"
+    return 0
+  fi
+  return 1
+}
 
 # ---------------------------------------------------------------- client
 
@@ -976,6 +1128,7 @@ while [ $# -gt 0 ]; do
     off|restart) MODE=power; POWER_ACTION="$1"; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
     _power-pending) power_pending; exit $? ;;
+    _busy) host_busy; exit $? ;;
     --role) ROLE="${2:-}"; shift ;;
     --host) HOST_ARG="${2:-}"; shift ;;
     --user) AGENT_USER="${2:-}"; shift ;;
@@ -1062,6 +1215,7 @@ if [ "$ROLE" = host ]; then
   step "Tailscale installed"              check_tailscale           install_tailscale
   if [ "$SYSTEMD" = 1 ]; then
     step "tailscaled enabled at boot"     check_tailscaled          install_tailscaled
+    step "tailscaled restarts after any crash" check_tailscaled_restart install_tailscaled_restart
     step "Tailscale up as '$AGENT_HOST' with Tailscale SSH" check_tailscale_up install_tailscale_up
   else
     info "skipping Tailscale service steps until systemd runs"
@@ -1093,6 +1247,14 @@ if [ "$ROLE" = host ]; then
   if [ "$SYSTEMD" = 1 ]; then
     step "herdr server starts at boot"    check_herdr_service       install_herdr_service
     step "user services run without login (linger)" check_linger   install_linger
+  fi
+fi
+
+if [ "$ROLE" = host ] && [ "$SYSTEMD" = 1 ]; then
+  section "Memory"
+  step "earlyoom kills one job, not the machine" check_earlyoom    install_earlyoom
+  if [ -n "$(runner_units)" ]; then
+    step "CI runners capped at 50% of memory, less CPU than agents" check_runner_caps install_runner_caps
   fi
 fi
 
