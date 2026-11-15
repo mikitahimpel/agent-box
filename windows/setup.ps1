@@ -3,7 +3,8 @@
 #   powershell -ExecutionPolicy Bypass -File windows\setup.ps1            check only
 #   powershell -ExecutionPolicy Bypass -File windows\setup.ps1 -Install   install or fix
 #
-# Options: -Distro Ubuntu  -WslMemoryGB <n>  -BackupDir <path>  -BackupKeep <n>
+# Options: -Distro Ubuntu  -WslMemoryGB <n>  -WslSwapGB <n>  -BackupDir <path>  -BackupKeep <n>
+#          -AgentHost <name>  -GitHubUser <login>  -LanSubnet <a.b.c.d/n>
 #
 # Run from an administrator PowerShell. Written for Windows PowerShell 5.1.
 
@@ -11,8 +12,12 @@ param(
     [switch]$Install,
     [string]$Distro = "Ubuntu",
     [int]$WslMemoryGB = 0,
+    [int]$WslSwapGB = 0,
     [string]$BackupDir = (Join-Path $env:USERPROFILE "wsl-backups"),
-    [int]$BackupKeep = 3
+    [int]$BackupKeep = 3,
+    [string]$AgentHost = "",
+    [string]$GitHubUser = "",
+    [string]$LanSubnet = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +34,9 @@ $WatchdogTask  = "agent-box net watchdog"
 $KeepaliveTask = "agent-box WSL keepalive"
 $ShutdownTask  = "agent-box remote shutdown"
 $BackupTask    = "agent-box WSL snapshot"
+$SshdConfig    = Join-Path $env:ProgramData "ssh\sshd_config"
+$AdminKeys     = Join-Path $env:ProgramData "ssh\administrators_authorized_keys"
+$TailscaleExe  = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
 $WslConfig     = Join-Path $env:USERPROFILE ".wslconfig"
 
 $script:Counts = @{ ok = 0; installed = 0; missing = 0; failed = 0 }
@@ -98,6 +106,34 @@ function Test-Distro {
     cmd /c "wsl.exe -d $Distro -- true >nul 2>&1"
     $LASTEXITCODE -eq 0
 }
+function Get-WslText([string]$Command) {
+    ((cmd /c "wsl.exe -d $Distro -- $Command 2>nul") -join "`n").Trim()
+}
+
+# Runs a native command with its stderr dropped; in Windows PowerShell 5.1 redirected
+# stderr would otherwise become a terminating error under $ErrorActionPreference = Stop.
+function Invoke-Quiet([scriptblock]$Block) {
+    $ErrorActionPreference = "Continue"
+    & $Block 2>$null
+}
+
+# IPv4 network of the interface holding the default route, e.g. 192.168.1.0/24.
+function Get-LocalSubnet {
+    $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1
+    if (-not $route) { return $null }
+    $addr = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1
+    if (-not $addr) { return $null }
+    $bytes = ([Net.IPAddress]$addr.IPAddress).GetAddressBytes()
+    [Array]::Reverse($bytes)
+    $ip = [int64][BitConverter]::ToUInt32($bytes, 0)
+    $mask = [int64]0
+    if ($addr.PrefixLength -gt 0) { $mask = [int64]([math]::Pow(2, 32) - [math]::Pow(2, 32 - $addr.PrefixLength)) }
+    $net = [BitConverter]::GetBytes([uint32]($ip -band $mask))
+    [Array]::Reverse($net)
+    "{0}/{1}" -f ([Net.IPAddress]::new($net).ToString()), $addr.PrefixLength
+}
 
 if (-not (Test-Admin)) {
     Write-Host "Run this from an administrator PowerShell." -ForegroundColor Red
@@ -128,23 +164,30 @@ if ($wslMemory -le 0) {
     $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
     $wslMemory = [math]::Max(4, [math]::Round($total / 1GB) - 4)
 }
-$wslConfigBody = "# Managed by agent-box.`r`n[wsl2]`r`nmemory=${wslMemory}GB"
+# Swap lets a burst of builds slow down instead of crashing the VM (earlyoom in WSL
+# still kills the biggest job first).
+$wslSwap = $WslSwapGB
+if ($wslSwap -le 0) { $wslSwap = [math]::Min(16, [math]::Max(8, [math]::Round($wslMemory / 2))) }
+$wslConfigBody = "# Managed by agent-box.`r`n[wsl2]`r`nmemory=${wslMemory}GB`r`nswap=${wslSwap}GB"
 function Test-ManagedWslConfig {
     if (-not (Test-Path $WslConfig)) { return $true }
     $text = (Get-Content $WslConfig -Raw).Trim()
     # Earlier versions wrote the same file without the marker.
     (-not $text) -or $text.StartsWith("# Managed by agent-box.") -or ($text -match '^\[wsl2\]\s+memory=\d+GB$')
 }
-Step "WSL memory cap in .wslconfig" {
+Step "WSL memory ${wslMemory}GB and swap ${wslSwap}GB in .wslconfig" {
     if (Test-ManagedWslConfig) { Test-ManagedScript $WslConfig $wslConfigBody }
-    else { Select-String -Path $WslConfig -Pattern '^\s*memory\s*=' -Quiet }
+    else {
+        (Select-String -Path $WslConfig -Pattern '^\s*memory\s*=' -Quiet) -and
+            (Select-String -Path $WslConfig -Pattern '^\s*swap\s*=' -Quiet)
+    }
 } {
     if (-not (Test-ManagedWslConfig)) {
-        Write-Info "$WslConfig was not written by agent-box; add 'memory=<N>GB' under [wsl2] yourself"
+        Write-Info "$WslConfig was not written by agent-box; add 'memory=<N>GB' and 'swap=<N>GB' under [wsl2] yourself"
         return
     }
     Set-Content -Path $WslConfig -Value $wslConfigBody -Encoding ASCII
-    $script:Notes.Add("WSL memory cap set to ${wslMemory}GB; it applies the next time WSL starts (restart the PC).")
+    $script:Notes.Add("WSL memory (${wslMemory}GB) and swap (${wslSwap}GB) apply the next time WSL starts (restart the PC).")
 }
 
 Write-Section "Power"
@@ -176,6 +219,162 @@ if ($wifi) {
     }
 } else {
     Write-Info "no Wi-Fi adapter found; skipping Wi-Fi checks"
+}
+
+Write-Section "Windows remote access"
+# Tailscale and SSH on Windows itself, so the PC can be reached (to restart WSL, read
+# logs) when WSL, and the Tailscale inside it, is down. Its Tailscale name is the
+# WSL host's name plus -win.
+$wslUp = Test-Distro
+if (-not $AgentHost -and $wslUp) {
+    $m = [regex]::Match((Get-WslText "cat ~/.config/agent-box/config"), '(?m)^AGENT_HOST=(\S+)')
+    if ($m.Success) { $AgentHost = $m.Groups[1].Value }
+}
+if (-not $AgentHost) { $AgentHost = $env:COMPUTERNAME.ToLower() }
+$winHost = "$AgentHost-win"
+
+function Get-WinTailscale([string]$Kind) {  # status | prefs
+    if (-not (Test-Path $TailscaleExe)) { return $null }
+    $cmdArgs = @("status", "--json")
+    if ($Kind -eq "prefs") { $cmdArgs = @("debug", "prefs") }
+    $text = Invoke-Quiet { & $TailscaleExe @cmdArgs } | Out-String
+    if ($text.Trim()) { $text | ConvertFrom-Json }
+}
+
+Step "Tailscale for Windows installed" { Test-Path $TailscaleExe } {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Info "winget not found; install Tailscale from https://tailscale.com/download/windows, then rerun"
+        return
+    }
+    & winget install --id Tailscale.Tailscale --exact --silent --accept-package-agreements --accept-source-agreements
+}
+
+if (Test-Path $TailscaleExe) {
+    # Unattended mode keeps Tailscale connected with nobody logged in to Windows.
+    Step "Windows on Tailscale as '$winHost', before anyone logs in (unattended)" {
+        $prefs = Get-WinTailscale prefs
+        ((Get-WinTailscale status).BackendState -eq "Running") -and ($prefs.Hostname -eq $winHost) -and $prefs.ForceDaemon
+    } {
+        if ((Get-WinTailscale status).BackendState -eq "Running") {
+            & $TailscaleExe set --unattended --hostname=$winHost
+        } else {
+            Write-Info "log in with the link Tailscale prints, with the same account as your other machines"
+            & $TailscaleExe up --unattended --hostname=$winHost
+        }
+    }
+    $script:Notes.Add("Tailscale admin console: disable key expiry for '$winHost'.")
+}
+
+Step "OpenSSH Server installed" {
+    $null -ne (Get-Service sshd -ErrorAction SilentlyContinue)
+} {
+    $cap = Get-WindowsCapability -Online -Name "OpenSSH.Server*" | Select-Object -First 1
+    Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+}
+
+# Only Tailscale (IPv4 and IPv6) and the local network may reach port 22. The local
+# network is detected each run; on another network, rerun to follow it.
+$lan = $LanSubnet
+if (-not $lan) { $lan = Get-LocalSubnet }
+if (-not $lan) { $lan = "192.168.50.0/24" }
+$sshFrom = @("100.64.0.0/10", "fd7a:115c:a1e0::/48", $lan)
+$sshRuleName = "agent-box-ssh"
+$sshRuleDescription = "Managed by agent-box. SSH from: $($sshFrom -join ', ')"
+Step "Windows SSH reachable only from Tailscale and $lan" {
+    $rule = Get-NetFirewallRule -Name $sshRuleName -ErrorAction SilentlyContinue
+    $open = Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue
+    $rule -and ("$($rule.Enabled)" -eq "True") -and ($rule.Description -eq $sshRuleDescription) -and
+        ((-not $open) -or ("$($open.Enabled)" -eq "False"))
+} {
+    Remove-NetFirewallRule -Name $sshRuleName -ErrorAction SilentlyContinue
+    New-NetFirewallRule -Name $sshRuleName -DisplayName "agent-box SSH (Tailscale and local network)" `
+        -Description $sshRuleDescription -Direction Inbound -Protocol TCP -LocalPort 22 `
+        -RemoteAddress $sshFrom -Action Allow -Profile Any | Out-Null
+    # The rule OpenSSH adds when installed allows port 22 from anywhere.
+    if (Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue) {
+        Disable-NetFirewallRule -Name "OpenSSH-Server-In-TCP"
+    }
+}
+
+if (Get-Service sshd -ErrorAction SilentlyContinue) {
+    Step "OpenSSH Server starts at boot" {
+        $svc = Get-Service sshd
+        ("$($svc.StartType)" -eq "Automatic") -and ("$($svc.Status)" -eq "Running")
+    } {
+        Set-Service sshd -StartupType Automatic
+        Start-Service sshd
+    }
+
+    # sshd uses the first value it reads, so the managed line goes first. The file
+    # stays ASCII: sshd doesn't accept a byte order mark.
+    $sshdMark = "# Managed by agent-box: keys only."
+    function Get-SshdOption([string]$Name) {
+        if (-not (Test-Path $SshdConfig)) { return $null }
+        $m = Select-String -Path $SshdConfig -Pattern "^\s*$Name\s+(\S+)" | Select-Object -First 1
+        if ($m) { $m.Matches[0].Groups[1].Value }
+    }
+    Step "Windows SSH accepts keys only (PasswordAuthentication no)" {
+        (Get-SshdOption "PasswordAuthentication") -eq "no"
+    } {
+        $lines = @(Get-Content $SshdConfig | Where-Object { $_ -notmatch '^\s*PasswordAuthentication\s' -and $_ -ne $sshdMark })
+        Copy-Item $SshdConfig "$SshdConfig.bak" -Force
+        Set-Content -Path $SshdConfig -Value (@($sshdMark, "PasswordAuthentication no", "") + $lines) -Encoding ASCII
+        & (Join-Path $env:WINDIR "System32\OpenSSH\sshd.exe") -t
+        if ($LASTEXITCODE -ne 0) {
+            Copy-Item "$SshdConfig.bak" $SshdConfig -Force
+            throw "sshd -t rejected the new config; the old one is back"
+        }
+        Restart-Service sshd
+    }
+
+    $psExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+    Step "Windows SSH opens PowerShell" {
+        (Get-ItemProperty "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue).DefaultShell -eq $psExe
+    } {
+        if (-not (Test-Path "HKLM:\SOFTWARE\OpenSSH")) { New-Item -Path "HKLM:\SOFTWARE\OpenSSH" | Out-Null }
+        New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -Value $psExe -PropertyType String -Force | Out-Null
+    }
+
+    # The same keys that push to GitHub: every agent-box machine uploads its own key
+    # there (github.com/<you>.keys). Windows' sshd reads the keys of administrators,
+    # which you are, from administrators_authorized_keys, not from ~\.ssh.
+    if (-not $GitHubUser -and $wslUp) { $GitHubUser = Get-WslText "gh api user --jq .login" }
+    $sshKeys = @()
+    if ($GitHubUser) {
+        try {
+            $sshKeys = @((Invoke-WebRequest "https://github.com/$GitHubUser.keys" -UseBasicParsing).Content -split "`n" |
+                ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        } catch {
+            Write-Info "couldn't read https://github.com/$GitHubUser.keys: $($_.Exception.Message)"
+        }
+    }
+    if ($sshKeys.Count -gt 0) {
+        $keysMark = "# Managed by agent-box."
+        $keysBody = (@("$keysMark SSH keys of github.com/$GitHubUser, one per machine.") + $sshKeys) -join "`r`n"
+        Step "Windows SSH accepts your machines' keys (github.com/$GitHubUser.keys)" {
+            if (-not (Test-Path $AdminKeys)) { return $false }
+            $text = "$(Get-Content $AdminKeys -Raw)"
+            if ($text.StartsWith($keysMark)) { $keysOk = $text.Trim() -eq $keysBody.Trim() }
+            else { $keysOk = @($sshKeys | Where-Object { -not $text.Contains($_) }).Count -eq 0 }
+            $keysOk -and (Get-Acl $AdminKeys).AreAccessRulesProtected
+        } {
+            $text = ""
+            if (Test-Path $AdminKeys) { $text = "$(Get-Content $AdminKeys -Raw)" }
+            if ($text -and -not $text.StartsWith($keysMark)) {
+                # Someone else's file: add the missing keys, keep the rest.
+                $missingKeys = @($sshKeys | Where-Object { -not $text.Contains($_) })
+                if ($missingKeys.Count -gt 0) { Add-Content -Path $AdminKeys -Value (@("") + $missingKeys) -Encoding ASCII }
+            } else {
+                Set-Content -Path $AdminKeys -Value $keysBody -Encoding ASCII
+            }
+            # sshd ignores this file unless only Administrators and SYSTEM can change it.
+            icacls.exe $AdminKeys /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
+        }
+        $script:Notes.Add("On the Mac, add to ~/.ssh/config: 'Host $winHost' with 'User $env:USERNAME', then 'ssh $winHost'.")
+    } else {
+        Write-Info "skipping Windows SSH keys: GitHub user unknown or has no keys; finish the Linux setup"
+        Write-Info "(gh logged in inside WSL) and rerun, or pass -GitHubUser <login>"
+    }
 }
 
 Write-Section "Scheduled tasks"
