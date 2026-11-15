@@ -192,7 +192,9 @@ if ($wslMemory -le 0) {
 # still kills the biggest job first).
 $wslSwap = $WslSwapGB
 if ($wslSwap -le 0) { $wslSwap = [math]::Min(16, [math]::Max(8, [math]::Round($wslMemory / 2))) }
-$wslConfigBody = "# Managed by agent-box.`r`n[wsl2]`r`nmemory=${wslMemory}GB`r`nswap=${wslSwap}GB"
+# vmIdleTimeout=-1: WSL otherwise shuts down a few minutes after its last window
+# closes, taking agents and the Tailscale inside it along.
+$wslConfigBody = "# Managed by agent-box.`r`n[wsl2]`r`nmemory=${wslMemory}GB`r`nswap=${wslSwap}GB`r`nvmIdleTimeout=-1"
 function Test-ManagedWslConfig {
     if (-not (Test-Path $WslConfig)) { return $true }
     $text = (Get-Content $WslConfig -Raw).Trim()
