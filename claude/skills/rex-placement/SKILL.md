@@ -1,21 +1,21 @@
 ---
 name: rex-placement
-description: Use when the user asks to start a task in a new worktree, or to hand a task to a new agent, and this session runs inside Rex (REX_SESSION is set and HERDR_ENV is not 1). Creates the worktree, opens it in its own Rex session with Claude, sends the prompt, and confirms the agent is working. Inside herdr use herdr-placement instead.
+description: Use when the user asks to start a task in a new worktree, or to hand a task to a new agent, and this session runs inside Rex (REX_SESSION is set and HC_TERMINAL_ID is not). Creates the worktree, opens it in its own Rex session with Claude, sends the prompt, and confirms the agent is working. Inside herdr-core (the Herdr app) use herdr-placement instead.
 ---
 
 # Rex placement
 
 ## Check where you are
 
-Run `echo "HERDR_ENV=$HERDR_ENV REX_SESSION=$REX_SESSION"`.
+Run `echo "HC_TERMINAL_ID=$HC_TERMINAL_ID REX_SESSION=$REX_SESSION"`.
 
-- `HERDR_ENV=1`: you are in herdr, even if herdr itself runs in a Rex pane. Stop and use the herdr-placement skill.
+- `HC_TERMINAL_ID` set: you are in an hc terminal (the Herdr app), even if it runs in a Rex pane. Stop and use the herdr-placement skill.
 - `REX_SESSION` empty: you are in neither. Tell the user and stop.
 - Otherwise continue.
 
 ## Machine
 
-Rex runs agents on this Mac only. If the task would belong on a host such as `pc` (the herdr-placement rules), say so in one line and ask whether to run it here or switch to herdr. Don't install a Rex server on a host unless asked.
+Rex runs agents on this Mac only. If the task would belong on a host such as `pc` (the herdr-placement rules), say so in one line and ask whether to run it here or switch to the Herdr app. Don't install a Rex server on a host unless asked.
 
 ## Start
 

@@ -597,7 +597,7 @@ $agentsOnBody = @"
 # Managed by agent-box. Starts WSL again after 'Agents off'.
 Remove-Item -Path '$PausedFlag' -Force -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName '$KeepaliveTask' -ErrorAction SilentlyContinue
-Write-Host "Agents are starting; they show up in herdr within a few minutes."
+Write-Host "Agents are starting; they show up in the Herdr app within a few minutes."
 Start-Sleep -Seconds 3
 "@
 
