@@ -940,6 +940,9 @@ install_earlyoom() {
 # with less memory and CPU than agents, so a burst of CI jobs can't take the
 # host down. Runners are only capped, never created or removed.
 RUNNER_SLICE=agent-box-runners.slice
+# No MemoryHigh: at that line the kernel stalls every process in the slice on
+# reclaim, and jobs sat there for an hour instead of failing. At MemoryMax the
+# slice gets 1G of swap, then the kernel kills the biggest process in it.
 runner_slice() {
   cat <<'EOF'
 # Managed by agent-box. CI runners get less memory and CPU than agents, and
@@ -948,15 +951,39 @@ runner_slice() {
 Description=CI runners (agent-box)
 
 [Slice]
-MemoryHigh=45%
 MemoryMax=50%
 MemorySwapMax=1G
 CPUWeight=20
 IOWeight=20
 EOF
 }
-runner_dropin() { printf '# Managed by agent-box.\n[Service]\nSlice=%s\n' "$RUNNER_SLICE"; }
+# GitHub's runner unit uses KillMode=process, so stopping or restarting it kills
+# only runsvc.sh: the old listener keeps its GitHub session, the new one exits
+# with "A session for this runner already exists", and systemd shows the unit
+# inactive while the orphan keeps taking jobs. mixed sends SIGTERM to runsvc.sh,
+# which stops the listener cleanly, and kills whatever is left at TimeoutStopSec.
+runner_dropin() { printf '# Managed by agent-box.\n[Service]\nSlice=%s\nKillMode=mixed\n' "$RUNNER_SLICE"; }
 runner_dropin_path() { echo "/etc/systemd/system/$1.d/agent-box-slice.conf"; }
+# Inactive units whose cgroup still holds processes: runners orphaned by a
+# restart under KillMode=process.
+orphaned_runners() {
+  local u cg
+  for u in $(runner_units); do
+    systemctl is-active --quiet "$u" && continue
+    cg="$(systemctl show -p ControlGroup --value "$u" 2>/dev/null)"
+    [ -n "$cg" ] && [ -s "/sys/fs/cgroup$cg/cgroup.procs" ] && echo "$u"
+  done
+}
+# Stops the unit, kills anything a stop leaves in its cgroup, and starts it again.
+restart_runner() {
+  local cg
+  cg="$(systemctl show -p ControlGroup --value "$1" 2>/dev/null)"
+  sudo systemctl stop "$1" || return 1
+  if [ -n "$cg" ] && [ -s "/sys/fs/cgroup$cg/cgroup.procs" ]; then
+    echo 1 | sudo tee "/sys/fs/cgroup$cg/cgroup.kill" >/dev/null || return 1
+  fi
+  sudo systemctl start "$1"
+}
 # Unit files, templates included (a drop-in for gh-runner@.service covers every instance).
 runner_units() {
   systemctl list-unit-files --type=service --no-legend 'gh-runner*' 'actions.runner*' 2>/dev/null | awk '{ print $1 }'
@@ -982,7 +1009,7 @@ check_runner_caps() {
   for u in $(runner_units); do
     file_is "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
   done
-  [ -z "$(runners_outside_slice)" ]
+  [ -z "$(runners_outside_slice)" ] && [ -z "$(orphaned_runners)" ]
 }
 install_runner_caps() {
   local u stale
@@ -991,15 +1018,97 @@ install_runner_caps() {
     write_root_file "$(runner_dropin_path "$u")" "$(runner_dropin)" || return 1
   done
   sudo systemctl daemon-reload || return 1
-  stale="$(runners_outside_slice | tr '\n' ' ')"
-  [ -n "$stale" ] || return 0
+  # A reload doesn't lift a limit already set on the running slice.
+  sudo systemctl set-property --runtime "$RUNNER_SLICE" MemoryHigh=infinity || return 1
+  stale="$({ runners_outside_slice; orphaned_runners; } | sort -u | tr '\n' ' ')"
+  [ -n "${stale// /}" ] || return 0
   # Moving a service to another slice needs a restart, which would kill a running job.
   if pgrep -x Runner.Worker >/dev/null; then
     info "a CI job is running; rerun once it's done (or reboot) to restart: $stale"
     return 1
   fi
-  # shellcheck disable=SC2086  # one argument per unit
-  sudo systemctl restart $stale
+  for u in $stale; do restart_runner "$u" || return 1; done
+}
+
+# CI jobs on these runners have no time limit unless the workflow sets one, and
+# a job stalled on memory kept a runner for hours. Every minute this stops the
+# steps of any pull-request job older than RUNNER_JOB_LIMIT; the job then fails
+# and the runner takes the next one. Other jobs (deploys, manual runs) are left
+# alone: stopping a deploy halfway can leave its state inconsistent.
+RUNNER_JOB_LIMIT=1800
+RUNNER_WATCHDOG=/usr/local/sbin/agent-box-runner-watchdog
+RUNNER_WATCHDOG_UNIT=/etc/systemd/system/agent-box-runner-watchdog.service
+RUNNER_WATCHDOG_TIMER=/etc/systemd/system/agent-box-runner-watchdog.timer
+runner_watchdog() {
+  cat <<EOF
+#!/bin/sh
+# Managed by agent-box. Fails pull-request CI jobs that run longer than the limit.
+limit="\${1:-$RUNNER_JOB_LIMIT}"
+EOF
+  cat <<'EOF'
+descendants() {
+  for c in $(pgrep -P "$1"); do echo "$c"; descendants "$c"; done
+}
+for worker in $(pgrep -x Runner.Worker); do
+  age="$(ps -o etimes= -p "$worker" | tr -d ' ')"
+  [ "${age:-0}" -gt "$limit" ] || continue
+  steps="$(descendants "$worker")"
+  [ -n "$steps" ] || continue
+  event=""
+  for p in $steps; do
+    event="$(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null | sed -n 's/^GITHUB_EVENT_NAME=//p')"
+    [ -n "$event" ] && break
+  done
+  [ "$event" = pull_request ] || continue
+  logger -t agent-box-runner-watchdog "stopping the steps of CI job $worker after ${age}s (limit ${limit}s)"
+  # shellcheck disable=SC2086  # one argument per process
+  kill -TERM $steps 2>/dev/null
+  sleep 20
+  # shellcheck disable=SC2086
+  kill -KILL $steps 2>/dev/null
+done
+exit 0
+EOF
+}
+runner_watchdog_unit() {
+  cat <<EOF
+# Managed by agent-box.
+[Unit]
+Description=Fail pull-request CI jobs that run too long (agent-box)
+
+[Service]
+Type=oneshot
+ExecStart=$RUNNER_WATCHDOG
+EOF
+}
+runner_watchdog_timer() {
+  cat <<'EOF'
+# Managed by agent-box.
+[Unit]
+Description=Check CI job age every minute (agent-box)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+check_runner_watchdog() {
+  file_is "$RUNNER_WATCHDOG" "$(runner_watchdog)" \
+    && file_is "$RUNNER_WATCHDOG_UNIT" "$(runner_watchdog_unit)" \
+    && file_is "$RUNNER_WATCHDOG_TIMER" "$(runner_watchdog_timer)" \
+    && systemctl is-active --quiet agent-box-runner-watchdog.timer
+}
+install_runner_watchdog() {
+  write_root_file "$RUNNER_WATCHDOG" "$(runner_watchdog)" \
+    && sudo chmod 755 "$RUNNER_WATCHDOG" \
+    && write_root_file "$RUNNER_WATCHDOG_UNIT" "$(runner_watchdog_unit)" \
+    && write_root_file "$RUNNER_WATCHDOG_TIMER" "$(runner_watchdog_timer)" \
+    && sudo systemctl daemon-reload \
+    && sudo systemctl enable --now agent-box-runner-watchdog.timer
 }
 
 # `agent-box _busy`, asked by the Windows idle-sleep task every 10 minutes: prints
@@ -1417,6 +1526,7 @@ if [ "$ROLE" = host ] && [ "$SYSTEMD" = 1 ]; then
   step "memory kept for tailscaled (256M) and hc + agents (20%)" check_memory_reserve install_memory_reserve
   if [ -n "$(runner_units)" ]; then
     step "CI runners capped at 50% of memory, less CPU than agents" check_runner_caps install_runner_caps
+    step "pull-request CI jobs stopped after $((RUNNER_JOB_LIMIT / 60)) minutes" check_runner_watchdog install_runner_watchdog
   fi
 fi
 
