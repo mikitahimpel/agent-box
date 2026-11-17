@@ -216,6 +216,30 @@ Step "WSL memory ${wslMemory}GB and swap ${wslSwap}GB in .wslconfig" {
     $script:Notes.Add("WSL memory (${wslMemory}GB) and swap (${wslSwap}GB) apply the next time WSL starts (restart the PC).")
 }
 
+# Every write inside WSL lands in the distro's ext4.vhdx through these processes.
+# Defender's real-time scan of them adds latency to each write and keeps a core
+# busy during builds and CI, so the disk and the processes are excluded.
+$WslProcesses = @("vmmem", "vmmemWSL", "wsl.exe", "wslhost.exe", "wslrelay.exe", "wslservice.exe")
+function Get-DistroFolder {
+    $key = Get-ChildItem "HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss" -ErrorAction SilentlyContinue |
+        Get-ItemProperty | Where-Object { $_.DistributionName -eq $Distro } | Select-Object -First 1
+    if ($key) { $key.BasePath -replace '^\\\\\?\\', '' }
+}
+$defenderOn = $false
+try { $defenderOn = (Get-MpComputerStatus -ErrorAction Stop).AMServiceEnabled } catch { }
+$distroFolder = Get-DistroFolder
+if ($defenderOn -and $distroFolder) {
+    Step "Defender skips WSL's disk and processes" {
+        $p = Get-MpPreference
+        ($p.ExclusionPath -contains $distroFolder) -and
+            (@($WslProcesses | Where-Object { $p.ExclusionProcess -notcontains $_ }).Count -eq 0)
+    } {
+        Add-MpPreference -ExclusionPath $distroFolder -ExclusionProcess $WslProcesses
+    }
+} elseif (-not $defenderOn) {
+    Write-Info "Microsoft Defender isn't the active antivirus; skipping WSL exclusions"
+}
+
 Write-Section "Power"
 # Fast Startup resumes a hibernated kernel, which skips startup task triggers and
 # keeps the last boot time, so 'Agents off' would outlast a power cycle.
@@ -461,10 +485,21 @@ if (Get-Service sshd -ErrorAction SilentlyContinue) {
             # sshd ignores this file unless only Administrators and SYSTEM can change it.
             icacls.exe $AdminKeys /inheritance:r /grant "*S-1-5-32-544:F" /grant "*S-1-5-18:F" | Out-Null
         }
-        $script:Notes.Add("On the Mac, add to ~/.ssh/config: 'Host $winHost' with 'User $env:USERNAME', then 'ssh $winHost'.")
+        $script:Notes.Add("On the Mac, rerun agent-box: it adds 'Host $winHost' (user $env:USERNAME) to ~/.ssh/config. Then 'ssh $winHost'.")
     } else {
         Write-Info "skipping Windows SSH keys: GitHub user unknown or has no keys; finish the Linux setup"
         Write-Info "(gh logged in inside WSL) and rerun, or pass -GitHubUser <login>"
+    }
+}
+
+# Clients read this to add '$winHost' with the right Windows user to their SSH config.
+if ($wslUp) {
+    $winFile = "WINDOWS_HOST=$winHost`nWINDOWS_USER=$env:USERNAME"
+    Step "WSL knows its Windows side ($env:USERNAME@$winHost)" {
+        (Get-WslText "cat ~/.config/agent-box/windows") -eq $winFile
+    } {
+        $sh = "mkdir -p ~/.config/agent-box && printf 'WINDOWS_HOST=%s\nWINDOWS_USER=%s\n' '$winHost' '$env:USERNAME' > ~/.config/agent-box/windows"
+        & wsl.exe -d $Distro -- sh -c $sh
     }
 }
 
@@ -510,6 +545,26 @@ function Register-UserTask([string]$Name, $Action, $Triggers, $Settings, [string
             Write-Host "            Windows rejected that password, try again." -ForegroundColor Yellow
             $script:TaskPassword = $null
         }
+    }
+}
+
+# A task saved with a password that no longer works (password changed, PC renamed)
+# never starts and leaves no trace but failed logons. Such tasks are removed here so
+# the steps below register them again with the current account and password.
+$UserTasks = @($KeepaliveTask, $ShutdownTask, $WslWatchdogTask)
+function Get-StuckTasks {
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    if (((Get-Date) - $boot).TotalMinutes -lt 15) { return @() }
+    @($UserTasks | Where-Object {
+        $t = Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue
+        $t -and ($t.State -eq "Disabled" -or ($t.State -ne "Running" -and
+            ($t | Get-ScheduledTaskInfo).LastRunTime -lt (Get-Date).AddMinutes(-15)))
+    })
+}
+Step "Tasks that run as $TaskUser start (saved password still works)" { (Get-StuckTasks).Count -eq 0 } {
+    foreach ($name in Get-StuckTasks) {
+        Write-Info "registering '$name' again: it hasn't started in 15 minutes"
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
     }
 }
 
