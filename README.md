@@ -213,7 +213,7 @@ Claude Code reports its state to Rex itself (Program Status Protocol), so tabs s
 
 All four are also in the command palette under **Agents**. A shortcut recorded in the app with **Change Shortcut…** overrides these.
 
-From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside the Herdr app, `herdr-placement` applies instead.
+From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside the Herdr app, `herdr-placement` (in the herdr-setup repo, with the Herdr layout) applies instead.
 
 Turn on **Remote Control** in Rex's settings (Rex Server) so commands run from a terminal, like `rex-task` or a history resume, can switch the app to the new session. Keys work without it.
 
