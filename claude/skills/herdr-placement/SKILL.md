@@ -43,7 +43,7 @@ When the task is mixed or unclear, use the Mac and say why in one line. Tell the
 ## Open the agent in the window
 
 1. Write the prompt to a file in your scratchpad with a quoted heredoc (`<<'EOF'`), so backticks and `$` are not executed by your shell. It states the goal, scope, out-of-scope, the machine's limits (no iOS on hosts, no release vaults), how to validate, the finish line (for example: branch pushed, PR open, not merged), and how to report: `hc send <your HC_TERMINAL_ID> "..."`, with the ID written out.
-2. One space per repo and machine; each task is a tab in it. Never make a space for a task: the sidebar groups by space, so a space per task scatters one repo across many groups. Find the repo's space in `herdr-app ls`: same machine, and named `<repo>`, or with its folder at the repo's main checkout or under `<home>/.herdr/worktrees/<repo>/`. Do not match on the worktree folder: each task's worktree is new, so that never finds the space. Only when no space matches, create it at the main checkout:
+2. One space per repo and machine; each task is a tab in it. Never make a space for a task: the sidebar groups by space, so a space per task scatters one repo across many groups. Find the repo's space in `herdr-app ls`: same machine, with its folder at the repo's main checkout. A space whose folder is a worktree is a leftover; don't add to it. Do not match on the worktree folder: each task's worktree is new, so that never finds the space. Only when no space matches, create it at the main checkout:
    ```bash
    herdr-app do space.new --name <repo> --machine <label> --folder <repo>
    ```
