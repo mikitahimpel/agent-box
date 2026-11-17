@@ -103,7 +103,7 @@ Gigabyte AORUS AM4:
 - Fast Startup off, so startup tasks run and **Agents off** ends when the PC is turned off
 - a **watchdog** task that resets Wi-Fi if the internet is down (at boot and every 3 min)
 - a **keepalive** task that keeps WSL running from boot, before anyone logs in (at boot and every 5 min)
-- a **WSL watchdog** task (every 3 min): if `wsl -d Ubuntu -- true` doesn't answer within 30 s twice in a row, it runs `wsl --shutdown` and starts the keepalive again; if tailscaled inside WSL is down twice in a row, it restarts it. It does nothing while **Agents off** is on or a snapshot runs.
+- a **WSL watchdog** task (every 3 min): if `wsl -d Ubuntu -- true` doesn't answer within 30 s twice in a row, it runs `wsl --shutdown` and starts the keepalive again; if tailscaled inside WSL is down, or up but offline (lost its connection to Tailscale's control server, as after a Wi-Fi reset), twice in a row, it restarts it. It does nothing while **Agents off** is on or a snapshot runs.
 - a **power events** task (at boot and hourly) that copies sleep, wake (with its source), shutdown, unexpected-reboot and crash events (Kernel-Power 41/42/107, 1074, 6005/6006/6008, bugchecks) to `C:\ProgramData\agent-box\power-events.log`
 - a **remote shutdown** task that turns Windows off after `agent-box off`, or restarts it after `agent-box restart` (checks every minute)
 - **Agents off** and **Agents on** shortcuts on the desktop (see [Games](#games-on-the-windows-pc))

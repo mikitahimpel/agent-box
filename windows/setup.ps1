@@ -732,7 +732,7 @@ function Write-Log([string]`$Message) {
 # runs but no longer answers (out of memory, stuck), and a tailscaled inside it that
 # is down, which takes the host off the tailnet.
 $wslWatchdogBody = @"
-# Managed by agent-box. Restarts WSL when it stops answering, and tailscaled in it when that is down.
+# Managed by agent-box. Restarts WSL when it stops answering, and tailscaled in it when that is down or offline.
 $pausedCheck
 # A snapshot export keeps WSL busy for a long time.
 if ("`$((Get-ScheduledTask -TaskName '$BackupTask' -ErrorAction SilentlyContinue).State)" -eq 'Running') { exit 0 }
@@ -760,9 +760,11 @@ if ((Invoke-Wsl '-d $Distro --cd ~ --exec true' 30).Code -eq -1) {
 }
 Set-Strikes 'wsl' 0
 
-# 10: tailscaled stopped, 11: it runs but Tailscale isn't up. One restart per outage.
-`$ts = (Invoke-Wsl '-d $Distro -u root --cd ~ --exec sh -c "systemctl is-enabled --quiet tailscaled || exit 0; systemctl is-active --quiet tailscaled || exit 10; tailscale status >/dev/null 2>&1 || exit 11"' 30).Code
-if (`$ts -eq 10 -or `$ts -eq 11) {
+# 10: tailscaled stopped, 11: it runs but Tailscale isn't up, 12: it is up but lost
+# its control connection (seen after a Wi-Fi reset: tailscaled kept waiting on the
+# dead connection and the host showed offline). One restart per outage.
+`$ts = (Invoke-Wsl '-d $Distro -u root --cd ~ --exec sh -c "systemctl is-enabled --quiet tailscaled || exit 0; systemctl is-active --quiet tailscaled || exit 10; tailscale status >/dev/null 2>&1 || exit 11; command -v jq >/dev/null || exit 0; tailscale status --json 2>/dev/null | jq -e .Self.Online >/dev/null || exit 12"' 30).Code
+if (`$ts -eq 10 -or `$ts -eq 11 -or `$ts -eq 12) {
     `$strikes = (Get-Strikes 'tailscale') + 1
     Set-Strikes 'tailscale' `$strikes
     if (`$strikes -eq 2) {
