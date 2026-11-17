@@ -97,6 +97,7 @@ Gigabyte AORUS AM4:
 - sleep on AC power to never (see [Sleep when idle](#sleep-when-idle-opt-in) for the opt-in alternative)
 - Wi-Fi adapter never powered off to save power; its Wake on Magic Packet / WoWLAN settings and "allow this device to wake the computer" on, where the driver has them (it prints what it found and the MAC address)
 - WSL memory capped at your RAM minus 4GB, plus 8–16GB swap (WSL only takes what it uses; switch agents off before games). `-WslMemoryGB` and `-WslSwapGB` override them.
+- Microsoft Defender skips WSL's disk (the distro's folder with `ext4.vhdx`) and its processes (`vmmemWSL`, `wsl.exe`, `wslservice.exe` …). Real-time scanning of them slows every write inside WSL. Files inside WSL are then no longer scanned by Defender.
 - **Tailscale for Windows** (winget) as `pc-win` (the WSL host's name plus `-win`), in unattended mode so it runs before anyone logs in
 - **OpenSSH Server**: keys only, PowerShell as the shell, port 22 open only to Tailscale and the local network (detected; `-LanSubnet` overrides). The keys are those of every agent-box machine, taken from `github.com/<you>.keys` (each machine uploads its own; see [GitHub](#github)) and written to `C:\ProgramData\ssh\administrators_authorized_keys`, the file Windows reads for administrators.
 - Fast Startup off, so startup tasks run and **Agents off** ends when the PC is turned off
@@ -108,7 +109,9 @@ Gigabyte AORUS AM4:
 - **Agents off** and **Agents on** shortcuts on the desktop (see [Games](#games-on-the-windows-pc))
 - a weekly **WSL snapshot** (`wsl --export`) to `%USERPROFILE%\wsl-backups`, keeping the newest 3. If the PC was off on Sunday, it runs at the next boot. To change it, run `windows\setup.ps1 -Install -BackupDir D:\wsl-backups -BackupKeep 5`.
 
-The tasks that touch WSL run as your Windows user before anyone logs in, so it asks for your Windows password once.
+The tasks that touch WSL run as your Windows user before anyone logs in, so it asks for your Windows password once. A task whose saved password stopped working (you changed the password, or renamed the PC) never starts and leaves no trace but failed logons in the Security log. On a rerun, any of these tasks that hasn't started in the last 15 minutes is registered again, which asks for the password.
+
+It also writes your Windows user and `pc-win` to `~/.config/agent-box/windows` inside WSL, so the Mac can add `pc-win` to its SSH config.
 
 If WSL isn't installed yet, it installs Ubuntu and stops. Reboot, open Ubuntu once to create your Linux user, then run the same command again. It then runs the Linux install inside WSL, restarting WSL once on the way to turn on systemd.
 
@@ -119,12 +122,9 @@ Also check these by hand:
 The watchdogs and the idle-sleep task log what they do, with timestamps, to `C:\ProgramData\agent-box\agent-box.log`.
 
 ### Getting in when WSL is down
-From the Mac, add the Windows user once to `~/.ssh/config` (the installer prints it):
-```
-Host pc-win
-    User <your Windows user>
-```
-Then `ssh pc-win` opens PowerShell on Windows:
+`agent-box install` on the Mac adds `Host pc-win` with your Windows user to `~/.ssh/config` (read from the PC while WSL is up, then kept). It also checks over that connection that the keepalive, WSL watchdog, remote shutdown and Wi-Fi watchdog tasks exist and have started in the last 15 minutes. If not, it says which one and asks you to rerun the Windows one-liner.
+
+`ssh pc-win` opens PowerShell on Windows:
 ```powershell
 wsl --shutdown                                          # stop a hung WSL
 Start-ScheduledTask 'agent-box WSL keepalive'           # start it again
@@ -151,16 +151,17 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - what hc needs: linger, so hc's core and its terminals keep running after the last SSH login closes, and `claude` on the login shell's PATH (hc starts programs with the login environment). hc itself arrives from the Mac (`hc machine add --install`); its core runs as a systemd user service the app starts over SSH
 - the user's systemd manager (`user@<uid>.service`, where hc's core, its terminals, agents and their builds run) capped at 60% (throttled) / 70% (hard limit) of memory, so they can't take the host down
 - the old herdr TUI removed if an earlier agent-box installed it: its server unit, binary, `~/.config/herdr` and its Claude hook. hc and its folders are left alone
-- tailscaled restarted after any crash (`Restart=always`, no start limit) and protected from the OOM killer
+- tailscaled restarted after any crash (`Restart=always`, no start limit), protected from the OOM killer, and with more CPU and disk weight than everything else
+- memory the kernel reclaims last: 256MB for tailscaled and 20% for `user.slice` (hc and the agents in its terminals). Docker containers and CI runners have none, so they are reclaimed and swapped first. For the 20% to reach hc's units, cgroup2 is remounted with `memory_recursiveprot` at boot (`agent-box-memory-protection.service`).
 - **earlyoom**: when memory runs low, it kills one build or test process (`node`, `vitest`, `jest`, `workerd`, `python`, `Runner.Worker`), never tailscaled, sshd, hc (`herdr-core`) or systemd
-- self-hosted GitHub runners (`gh-runner*`, `actions.runner*` services), if there are any: moved into their own slice with at most 50% of memory and a lower CPU weight than agents. It never creates or removes runners, and restarts them only when no job runs.
+- self-hosted GitHub runners (`gh-runner*`, `actions.runner*` services), if there are any: moved into their own slice with at most 50% of memory, 1GB of swap, and a lower CPU and disk weight than agents. These are weights, not quotas: CI uses the whole machine when it's idle, and yields when agents or hc need it. A job that needs more memory fails instead of swapping the host to a crawl. It never creates or removes runners, and restarts them only when no job runs.
 - Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
 - Proton Pass CLI, this machine's Proton Pass token (asked once) and the `pp` wrapper
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
-On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` and an hc machine per host, which the Herdr app shows. A host must be on for the Mac to add it.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) and an hc machine per host, which the Herdr app shows. A host must be on for the Mac to add it.
 
 ## Tailscale admin console (once)
 - **Machines → each host → Disable key expiry**
@@ -309,7 +310,7 @@ If it doesn't come online:
 - `install.ps1` and `windows/setup.ps1` are written for Windows PowerShell 5.1 but haven't been run on a real machine yet. Read their output before trusting them.
 - Host discovery logs in to each new Linux peer with Tailscale SSH to look for agent-box. A peer whose user isn't among the tried ones is skipped; add it with `--host user@name`.
 - `pp` and project tools assume `pass-cli info` fails when the session has expired. Run `pp info` again 2 hours after setup to confirm the automatic re-login.
-- If you change your Windows password, delete the `agent-box` tasks in Task Scheduler and run the Windows one-liner again.
+- If you change your Windows password, run the Windows one-liner again; it registers the tasks that stopped starting.
 - `wsl --export` of a running distro and the shutdown task's call into WSL are untested on a real PC. Check Task Scheduler's "Last Run Result" after the first week.
 - Snapshots are full copies of Ubuntu and can be large. Point `-BackupDir` at a drive with room.
 - Windows Tailscale and SSH, the WSL watchdog, the power events log, the Wi-Fi wake settings and sleep when idle are written from the documentation and haven't run on the PC yet.

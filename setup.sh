@@ -49,6 +49,7 @@ config_get() { [ -f "$CONFIG_FILE" ] && sed -n "s/^$1=//p" "$CONFIG_FILE" | tail
 ROLE="${AGENT_ROLE:-$(config_get AGENT_ROLE)}"
 AGENT_HOST="${AGENT_HOST:-$(config_get AGENT_HOST)}"
 AGENT_HOSTS="${AGENT_HOSTS:-$(config_get AGENT_HOSTS)}"
+AGENT_WIN_HOSTS="${AGENT_WIN_HOSTS:-$(config_get AGENT_WIN_HOSTS)}"
 AGENT_USER="${AGENT_USER:-$(config_get AGENT_USER)}"
 PASS_VAULT="${PASS_VAULT:-$(config_get PASS_VAULT)}"
 PASS_TOKEN_VAULTS="${PASS_TOKEN_VAULTS:-$(config_get PASS_TOKEN_VAULTS)}"
@@ -631,6 +632,7 @@ config_body() {
   printf 'AGENT_ROLE=%s\n' "$ROLE"
   if [ "$ROLE" = host ]; then printf 'AGENT_HOST=%s\n' "$AGENT_HOST"
   else printf 'AGENT_HOSTS=%s\n' "$AGENT_HOSTS"; fi
+  [ "$ROLE" = host ] || [ -z "$AGENT_WIN_HOSTS" ] || printf 'AGENT_WIN_HOSTS=%s\n' "$AGENT_WIN_HOSTS"
   printf 'PASS_VAULT=%s\n' "$PASS_VAULT"
   [ -z "$PASS_TOKEN_VAULTS" ] || printf 'PASS_TOKEN_VAULTS=%s\n' "$PASS_TOKEN_VAULTS"
   printf 'AGENT_AUTONOMOUS=%s\n' "$AUTONOMOUS"
@@ -752,6 +754,9 @@ StartLimitIntervalSec=0
 Restart=always
 RestartSec=5
 OOMScoreAdjust=-900
+MemoryLow=256M
+CPUWeight=500
+IOWeight=500
 EOF
 }
 check_tailscaled_restart() {
@@ -859,6 +864,53 @@ install_user_memory_cap() {
   sudo systemctl set-property --runtime "$USER_UNIT" MemoryHigh=60% MemoryMax=70%
 }
 
+# Memory the kernel reclaims last: tailscaled (the only way in) and everything under
+# user.slice (hc and the agents in its terminals). MemoryLow only counts if every
+# ancestor claims it too, and hc's units are transient, so the cgroup2 mount gets
+# memory_recursiveprot: a slice's protection is then shared out to its children by
+# use. Docker containers and CI runners claim none and are reclaimed (and swapped)
+# first.
+RECURSIVEPROT_UNIT=/etc/systemd/system/agent-box-memory-protection.service
+SYSTEM_SLICE_DROPIN=/etc/systemd/system/system.slice.d/agent-box.conf
+USER_SLICE_DROPIN=/etc/systemd/system/user.slice.d/agent-box.conf
+recursiveprot_unit() {
+  cat <<'EOF'
+# Managed by agent-box. Lets the memory protection of a slice reach the units in it.
+[Unit]
+Description=Memory protection reaches nested cgroups (agent-box)
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount -o remount,nsdelegate,memory_recursiveprot /sys/fs/cgroup
+
+[Install]
+WantedBy=sysinit.target
+EOF
+}
+system_slice_dropin() { printf '# Managed by agent-box. Room for tailscaled.\n[Slice]\nMemoryLow=256M\n'; }
+user_slice_dropin() { printf '# Managed by agent-box. Room for hc and the agents in its terminals.\n[Slice]\nMemoryLow=20%%\n'; }
+has_recursiveprot() { awk '$3 == "cgroup2" && $4 ~ /memory_recursiveprot/' /proc/mounts | grep -q .; }
+check_memory_reserve() {
+  file_is "$RECURSIVEPROT_UNIT" "$(recursiveprot_unit)" \
+    && file_is "$SYSTEM_SLICE_DROPIN" "$(system_slice_dropin)" \
+    && file_is "$USER_SLICE_DROPIN" "$(user_slice_dropin)" \
+    && systemctl is-enabled agent-box-memory-protection.service >/dev/null 2>&1 \
+    && has_recursiveprot \
+    && [ "$(systemctl show -p MemoryLow --value user.slice 2>/dev/null)" != 0 ]
+}
+install_memory_reserve() {
+  write_root_file "$RECURSIVEPROT_UNIT" "$(recursiveprot_unit)" \
+    && write_root_file "$SYSTEM_SLICE_DROPIN" "$(system_slice_dropin)" \
+    && write_root_file "$USER_SLICE_DROPIN" "$(user_slice_dropin)" \
+    && sudo systemctl daemon-reload \
+    && sudo systemctl enable agent-box-memory-protection.service || return 1
+  sudo systemctl restart agent-box-memory-protection.service \
+    || { info "this kernel can't remount cgroup2 with memory_recursiveprot"; return 1; }
+}
+
 # ---------------------------------------------------------------- memory
 
 # earlyoom acts before the kernel's OOM killer would stall the machine: it kills
@@ -890,13 +942,15 @@ install_earlyoom() {
 RUNNER_SLICE=agent-box-runners.slice
 runner_slice() {
   cat <<'EOF'
-# Managed by agent-box. CI runners get less memory and CPU than agents.
+# Managed by agent-box. CI runners get less memory and CPU than agents, and
+# little swap: a job that needs more fails instead of slowing the whole host.
 [Unit]
 Description=CI runners (agent-box)
 
 [Slice]
 MemoryHigh=45%
 MemoryMax=50%
+MemorySwapMax=1G
 CPUWeight=20
 IOWeight=20
 EOF
@@ -1044,9 +1098,33 @@ discover_hosts() {
   done
 }
 
+# A WSL host's Windows side, '<host>-win' (windows/setup.ps1), is how you get in
+# when WSL is down. Its user is the Windows one, which windows/setup.ps1 writes to
+# ~/.config/agent-box/windows inside WSL. Saved as AGENT_WIN_HOSTS (user@name) so
+# the SSH config keeps it while WSL is down.
+win_entry_from_host() {
+  with_timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" 'cat ~/.config/agent-box/windows 2>/dev/null' \
+    </dev/null 2>/dev/null | tr -d '\r' \
+    | awk -F= '$1 == "WINDOWS_USER" { u = $2 } $1 == "WINDOWS_HOST" { h = $2 } END { if (u != "" && h != "") print u "@" h }'
+}
+# Adds or updates the Windows side of every reachable host.
+refresh_win_hosts() {
+  local n e w list
+  for n in $(host_names); do
+    e="$(win_entry_from_host "$n")"
+    [ -n "$e" ] || continue
+    list=""
+    for w in $AGENT_WIN_HOSTS; do
+      [ "$(host_name "$w")" = "$(host_name "$e")" ] || list="${list:+$list }$w"
+    done
+    AGENT_WIN_HOSTS="${list:+$list }$e"
+  done
+}
+win_host_names() { local h; for h in $AGENT_WIN_HOSTS; do host_name "$h"; done; }
+
 ssh_block() {
   local h n sep=""
-  for h in $AGENT_HOSTS; do
+  for h in $AGENT_HOSTS $AGENT_WIN_HOSTS; do
     n="$(host_name "$h")"
     printf '%sHost %s\n    HostName %s\n    User %s' "$sep" "$n" "$n" "$(host_user "$h")"
     sep=$'\n\n'
@@ -1102,6 +1180,48 @@ install_hc_machine() {
   printf '%s\n' "$out" | sed 's/^/    /'
   return 1
 }
+
+# The Windows tasks that keep WSL up (windows/setup.ps1). A task whose saved
+# password no longer works (password changed, PC renamed) never starts and says
+# nothing, so each must have started in the last 15 minutes. Prints one line per
+# problem, then "checked".
+WIN_TASKS_PS='
+$boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$settled = ((Get-Date) - $boot).TotalMinutes -gt 15
+foreach ($n in "agent-box WSL keepalive", "agent-box WSL watchdog", "agent-box remote shutdown", "agent-box net watchdog") {
+    $t = Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue
+    if (-not $t) { "missing: $n"; continue }
+    if ($t.State -eq "Disabled") { "disabled: $n"; continue }
+    $last = ($t | Get-ScheduledTaskInfo).LastRunTime
+    if ($settled -and $t.State -ne "Running" -and $last -lt (Get-Date).AddMinutes(-15)) {
+        "not starting: $n (last run $($last.ToString("yyyy-MM-dd HH:mm")))"
+    }
+}
+"checked"
+'
+# win_ps <win host> <script>: Windows sshd opens PowerShell; -EncodedCommand keeps
+# the script intact through both shells.
+win_ps() {
+  local enc
+  enc="$(printf '%s' "\$ProgressPreference = 'SilentlyContinue'; $2" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')"
+  with_timeout 40 ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$1" \
+    "powershell -NoProfile -NonInteractive -EncodedCommand $enc" </dev/null 2>/dev/null | tr -d '\r'
+}
+WIN_PROBLEMS=""
+check_win_tasks() {
+  local out
+  out="$(win_ps "$CUR_WIN" "$WIN_TASKS_PS")"
+  printf '%s\n' "$out" | grep -qx checked || { WIN_PROBLEMS="couldn't run PowerShell over SSH"; return 1; }
+  WIN_PROBLEMS="$(printf '%s\n' "$out" | grep -vx checked | grep . || true)"
+  [ -z "$WIN_PROBLEMS" ]
+}
+install_win_tasks() {
+  info "on $CUR_WIN, in an administrator PowerShell, rerun the Windows install (it asks"
+  info "for your Windows password and registers the tasks again):"
+  info "  irm https://raw.githubusercontent.com/mikitahimpel/agent-box/main/install.ps1 | iex"
+  return 1
+}
+show_win_problems() { printf '%s\n' "$WIN_PROBLEMS" | while IFS= read -r l; do [ -z "$l" ] || info "$l"; done; }
 
 # ---------------------------------------------------------------- add
 
@@ -1289,6 +1409,7 @@ if [ "$ROLE" = host ] && [ "$SYSTEMD" = 1 ]; then
   section "Memory"
   step "agents capped at 60% (throttled) / 70% of memory" check_user_memory_cap install_user_memory_cap
   step "earlyoom kills one job, not the machine" check_earlyoom    install_earlyoom
+  step "memory kept for tailscaled (256M) and hc + agents (20%)" check_memory_reserve install_memory_reserve
   if [ -n "$(runner_units)" ]; then
     step "CI runners capped at 50% of memory, less CPU than agents" check_runner_caps install_runner_caps
   fi
@@ -1324,16 +1445,25 @@ if [ "$ROLE" = client ]; then
       AGENT_HOSTS="${AGENT_HOSTS:+$AGENT_HOSTS }$_h"
     done
   fi
+  [ -z "$AGENT_HOSTS" ] || refresh_win_hosts
   if [ -z "$AGENT_HOSTS" ]; then
     info "no hosts yet: set one up (the one-line install on it), then rerun here"
   else
-    step "SSH config for $(host_names | paste -sd, - | sed 's/,/, /g')" check_ssh_config install_ssh_config
+    step "SSH config for $({ host_names; win_host_names; } | paste -sd, - | sed 's/,/, /g')" check_ssh_config install_ssh_config
   fi
   if [ -n "$AGENT_HOSTS" ] && check_ssh_config; then
     for CUR_HOST in $(host_names); do
       step "$CUR_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
       if have hc && check_ssh_reachable; then
         step "hc machine '$CUR_HOST' (shows in the Herdr app)" check_hc_machine install_hc_machine
+      fi
+    done
+    for CUR_WIN in $(win_host_names); do
+      if win_ps "$CUR_WIN" '"checked"' | grep -qx checked; then
+        step "Windows tasks on $CUR_WIN start (WSL keepalive, watchdogs)" check_win_tasks install_win_tasks \
+          || show_win_problems
+      else
+        missing "$CUR_WIN reachable over SSH (Windows side of a WSL host)"
       fi
     done
   fi
