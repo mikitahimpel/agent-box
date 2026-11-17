@@ -43,16 +43,16 @@ When the task is mixed or unclear, use the Mac and say why in one line. Tell the
 ## Open the agent in the window
 
 1. Write the prompt to a file in your scratchpad with a quoted heredoc (`<<'EOF'`), so backticks and `$` are not executed by your shell. It states the goal, scope, out-of-scope, the machine's limits (no iOS on hosts, no release vaults), how to validate, the finish line (for example: branch pushed, PR open, not merged), and how to report: `hc send <your HC_TERMINAL_ID> "..."`, with the ID written out.
-2. Find the project's space in `herdr-app ls`, matching folder and machine. Without one, create it:
+2. One space per repo and machine; each task is a tab in it. Never make a space for a task: the sidebar groups by space, so a space per task scatters one repo across many groups. Find the repo's space in `herdr-app ls`: same machine, and named `<repo>`, or with its folder at the repo's main checkout or under `<home>/.herdr/worktrees/<repo>/`. Do not match on the worktree folder: each task's worktree is new, so that never finds the space. Only when no space matches, create it at the main checkout:
    ```bash
-   herdr-app do space.new --name <project> --machine <label> --folder <worktree>
+   herdr-app do space.new --name <repo> --machine <label> --folder <repo>
    ```
-   (no `--machine` on the Mac). It opens with a shell tab; close that terminal with `hc kill` and `hc rm` once the agent tab exists.
-3. Open the agent as a named tab in that space:
+   (no `--machine` on the Mac; `<repo>` is the repo's folder name, `billet`, not the task). It opens with a shell tab; close that terminal with `hc kill` and `hc rm` once the agent tab exists.
+3. Open the agent as a named tab in that space, in the task's worktree:
    ```bash
-   herdr-app do tab.new --space <space-id> --name "<short task>" --argv '["claude"]' --task "$(cat <file>)"
+   herdr-app do tab.new --space <space-id> --name "<short task>" --folder <worktree> --argv '["claude"]' --task "$(cat <file>)"
    ```
-   If the tab does not start in the worktree, add `--folder <worktree>`; check the exact arguments with `herdr-app commands`.
+   The tab's own folder carries the branch, and the sidebar shows it on the tab. Check the exact arguments with `herdr-app commands`.
 4. The result names its terminal (`pc/t2z`). `hc ls` must show it `working`; `hc read <terminal> --lines 0` shows its screen. A folder trust prompt for the user's own repository is answered with Enter; any other prompt goes to the user.
 
 Report to the user: machine, space and tab names, branch.
