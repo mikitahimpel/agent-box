@@ -965,10 +965,15 @@ active_runners() {
   systemctl list-units --type=service --state=active --no-legend --plain 'gh-runner*' 'actions.runner*' 2>/dev/null \
     | awk '{ print $1 }'
 }
+# Slice= shows the configured slice as soon as systemd reloads; ControlGroup
+# shows where the running process actually is until the unit restarts.
 runners_outside_slice() {
   local u
   for u in $(active_runners); do
-    [ "$(systemctl show -p Slice --value "$u" 2>/dev/null)" = "$RUNNER_SLICE" ] || echo "$u"
+    case "$(systemctl show -p ControlGroup --value "$u" 2>/dev/null)" in
+      */"$RUNNER_SLICE"/*) ;;
+      *) echo "$u" ;;
+    esac
   done
 }
 check_runner_caps() {
@@ -989,7 +994,7 @@ install_runner_caps() {
   stale="$(runners_outside_slice | tr '\n' ' ')"
   [ -n "$stale" ] || return 0
   # Moving a service to another slice needs a restart, which would kill a running job.
-  if pgrep -f 'Runner[.]Worker' >/dev/null; then
+  if pgrep -x Runner.Worker >/dev/null; then
     info "a CI job is running; rerun once it's done (or reboot) to restart: $stale"
     return 1
   fi
@@ -1012,7 +1017,7 @@ claude_cpu() {  # "pid ticks" per claude process
 }
 host_busy() {
   local load now secs
-  if pgrep -f 'Runner[.]Worker' >/dev/null; then echo "CI job running"; return 0; fi
+  if pgrep -x Runner.Worker >/dev/null; then echo "CI job running"; return 0; fi
   load="$(cut -d' ' -f2 /proc/loadavg)"
   if awk -v l="$load" -v m="$BUSY_LOAD" 'BEGIN { exit !(l >= m) }'; then
     echo "load average $load"
