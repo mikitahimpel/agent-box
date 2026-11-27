@@ -15,7 +15,7 @@ Run `echo "HC_TERMINAL_ID=$HC_TERMINAL_ID REX_SESSION=$REX_SESSION"`.
 
 ## Machine
 
-Rex runs agents on this Mac only. If the task would belong on a host such as `pc` (the herdr-placement rules), say so in one line and ask whether to run it here or switch to the Herdr app. Don't install a Rex server on a host unless asked.
+Rex runs agents on this Mac only. If the task would belong on a host such as `pc` ("Where tasks run" in `~/.claude/CLAUDE.md`), say so in one line and ask whether to run it here or switch to the Herdr app. Don't install a Rex server on a host unless asked.
 
 ## Start
 

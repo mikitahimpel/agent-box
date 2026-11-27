@@ -200,12 +200,32 @@ login_shell_block() {
     echo 'export PROTON_PASS_KEY_PROVIDER="${PROTON_PASS_KEY_PROVIDER:-fs}"'
   fi
 }
-check_path_in_login_shell() {
+# A login profile that is a symlink belongs to the user's own dotfiles. agent-box
+# never writes through it; it only checks that a login shell ends up with what
+# the block would set.
+login_rc_is_external() { [ -L "$(login_rc)" ]; }
+login_shell_env_ok() {
   local shell="${SHELL:-/bin/bash}"
-  block_matches "$(login_rc)" "$(login_shell_block)" \
-    && "$shell" -lc 'case ":$PATH:" in *":$HOME/.local/bin:"*) exit 0 ;; *) exit 1 ;; esac' </dev/null >/dev/null 2>&1
+  "$shell" -lc '
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) exit 1 ;; esac
+    [ "$1" = mac ] || [ "${PROTON_PASS_KEY_PROVIDER:-}" = fs ]
+  ' _ "$PLATFORM" </dev/null >/dev/null 2>&1
 }
-install_path_in_login_shell() { replace_block "$(login_rc)" "$(login_shell_block)"; }
+check_path_in_login_shell() {
+  if login_rc_is_external; then
+    login_shell_env_ok
+    return
+  fi
+  block_matches "$(login_rc)" "$(login_shell_block)" && login_shell_env_ok
+}
+install_path_in_login_shell() {
+  if login_rc_is_external; then
+    info "$(login_rc) links into your own config; set this there for login shells:"
+    login_shell_block | while IFS= read -r line; do info "  $line"; done
+    return 1
+  fi
+  replace_block "$(login_rc)" "$(login_shell_block)"
+}
 
 # Anything here owned by root (left by an earlier `sudo`) makes the installers
 # fail with "permission denied".
@@ -246,7 +266,16 @@ install_claude_login_path() {
 hc_installed() { have herdr-core || [ -x "$BIN_DIR/herdr-core" ]; }
 
 check_pass_cli() { have pass-cli; }
-install_pass_cli() { curl -fsSL https://proton.me/download/pass-cli/install.sh | bash; }
+# On macOS Proton's Homebrew tap: its build is signed by Proton AG, so the
+# Keychain keeps trusting it after upgrades. homebrew-core's proton-pass-cli is
+# ad-hoc signed and asks for Keychain access again after every upgrade.
+install_pass_cli() {
+  if [ "$PLATFORM" = mac ] && have brew; then
+    brew install protonpass/tap/pass-cli
+    return
+  fi
+  curl -fsSL https://proton.me/download/pass-cli/install.sh | bash
+}
 
 # Agent tokens look like pst_<token>::<key>.
 valid_token() {
@@ -489,10 +518,72 @@ install_rex_agents() {
   for pair in $REX_LINKS; do
     mkdir -p "$(dirname "${pair#*:}")" && ln -sfn "$REPO_DIR/rex/${pair%%:*}" "${pair#*:}" || return 1
   done
-  grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null ||
-    printf '%s\n' '-- Agent workflow from agent-box.' 'require("agents")' >> "$REX_CONFIG_DIR/init.lua"
+  if grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null; then
+    have rex && rex config reload >/dev/null 2>&1
+    return 0
+  fi
+  # A linked init.lua belongs to the user's own dotfiles: never write through it.
+  if [ -L "$REX_CONFIG_DIR/init.lua" ]; then
+    info "~/.config/rex/init.lua links into your own config; add require(\"agents\") there"
+    return 1
+  fi
+  printf '%s\n' '-- Agent workflow from agent-box.' 'require("agents")' >> "$REX_CONFIG_DIR/init.lua"
   have rex && rex config reload >/dev/null 2>&1
   return 0
+}
+
+# Mac client: an always-on SSH agent with the SSH keys in the agents' vault,
+# started through pp so it logs the shared session back in when it expires.
+# Point ssh at it with `IdentityAgent ~/.ssh/proton-agents.sock`.
+SSH_AGENT_LABEL="dev.agent-box.proton-ssh-agent"
+SSH_AGENT_PLIST="$HOME/Library/LaunchAgents/$SSH_AGENT_LABEL.plist"
+SSH_AGENT_SOCKET="$HOME/.ssh/proton-agents.sock"
+SSH_AGENT_LOG="$HOME/Library/Logs/agent-box-ssh-agent.log"
+ssh_agent_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Managed by agent-box. SSH agent for the keys in the "$PASS_VAULT" vault. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$SSH_AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>rm -f "$SSH_AGENT_SOCKET"; exec "$BIN_DIR/pp" ssh-agent start --vault-name "$PASS_VAULT" --socket-path "$SSH_AGENT_SOCKET"</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PROTON_PASS_AGENT_REASON</key>
+    <string>SSH agent for $PASS_VAULT vault keys</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>$SSH_AGENT_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$SSH_AGENT_LOG</string>
+</dict>
+</plist>
+EOF
+}
+check_ssh_agent() {
+  ssh_agent_plist | cmp -s - "$SSH_AGENT_PLIST" &&
+    launchctl print "gui/$(id -u)/$SSH_AGENT_LABEL" >/dev/null 2>&1
+}
+install_ssh_agent() {
+  mkdir -p "$(dirname "$SSH_AGENT_PLIST")" "$HOME/.ssh" || return 1
+  ssh_agent_plist > "$SSH_AGENT_PLIST" || return 1
+  launchctl bootout "gui/$(id -u)/$SSH_AGENT_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$SSH_AGENT_PLIST"
 }
 
 # Autonomous mode: Bash runs inside Claude's sandbox without prompts, file edits
@@ -1593,6 +1684,9 @@ step "pp wrapper"                         check_pp                  install_pp
 step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
 if have pass-cli && check_token && check_pp; then
   step "pp can log in"                    check_pp_works            install_pp_works
+  if [ "$PLATFORM" = mac ] && [ "$ROLE" = client ]; then
+    step "SSH agent for $PASS_VAULT vault keys (~/.ssh/proton-agents.sock)" check_ssh_agent install_ssh_agent
+  fi
 fi
 
 if [ "$ROLE" = client ]; then

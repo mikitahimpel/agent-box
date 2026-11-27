@@ -160,10 +160,10 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
 - Proton Pass CLI, this machine's Proton Pass token (asked once) and the `pp` wrapper
-- the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
+- the agent-box section in `~/.claude/CLAUDE.md`: shared working rules and where tasks run (`claude/CLAUDE.md`), secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
-On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts (`pass-cli` from Proton's Homebrew tap, whose signed build keeps its Keychain access across upgrades), an always-on SSH agent with the SSH keys in the agents' vault (launchd `dev.agent-box.proton-ssh-agent`, socket `~/.ssh/proton-agents.sock`; point ssh at it with `IdentityAgent`), plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
 
 ## Tailscale admin console (once)
 - **Machines → each host → Disable key expiry**
@@ -202,7 +202,7 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 
 ## Rex on the Mac
 
-[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Each host also runs a Rex server, and the Mac adds it as a Rex host reached over SSH, so `rex -S pc new myproject` or the Rex app opens sessions on **pc** (see [Rex on hosts](#rex-on-hosts)). The agent workflow below (`rex-agent`, `rex-task`) still runs agents on the Mac only.
+[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. If `init.lua` (or the login profile `~/.zprofile`) is a link into your own dotfiles, agent-box never writes through it: it checks that the line is there and tells you what to add. Each host also runs a Rex server, and the Mac adds it as a Rex host reached over SSH, so `rex -S pc new myproject` or the Rex app opens sessions on **pc** (see [Rex on hosts](#rex-on-hosts)). The agent workflow below (`rex-agent`, `rex-task`) still runs agents on the Mac only.
 
 Claude Code reports its state to Rex itself (Program Status Protocol), so tabs show a spinner while an agent works and the session picker marks agents that are blocked or done. The pieces on top:
 
