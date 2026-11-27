@@ -837,6 +837,24 @@ install_no_herdr_tui() {
 check_linger() { loginctl show-user "$USER" -p Linger 2>/dev/null | grep 'Linger=yes' >/dev/null; }
 install_linger() { sudo loginctl enable-linger "$USER"; }
 
+# Rex server on a host, installed for this account only (no sudo) into
+# ~/.local/bin. The installer then runs 'rex server install', which starts the
+# server from the rex.socket user unit on the first connection. Clients reach
+# it over SSH, so it needs no port of its own.
+REX_INSTALLER="https://pkgs.superlogical.com/rex/install.sh"
+REX_CHANNEL="preview"
+REX_BIN="$BIN_DIR/rex"
+# Ubuntu has an unrelated Perl tool named rex; ours prints "rex <version>".
+rex_is_superlogical() { "$REX_BIN" version 2>/dev/null | head -n 1 | grep -q '^rex '; }
+rex_socket_enabled() { systemctl --user is-enabled --quiet rex.socket 2>/dev/null; }
+check_rex_server() { rex_is_superlogical && rex_socket_enabled; }
+install_rex_server() {
+  if ! rex_is_superlogical; then
+    curl -fsSL "$REX_INSTALLER" | sh -s -- --user --channel "$REX_CHANNEL" || return 1
+  fi
+  rex_socket_enabled || "$REX_BIN" server install
+}
+
 # On Linux hc runs its core, and the holders that keep each terminal, as
 # transient services of the user's systemd manager (systemd-run --user), so
 # agents and their builds all run under user@<uid>.service. Capping that unit
@@ -1295,6 +1313,30 @@ install_hc_machine() {
   return 1
 }
 
+# Each host that runs a Rex server becomes a Rex host reached over SSH, so
+# 'rex -S <host> …' and the Rex app can open sessions there.
+host_user_of() {
+  local h
+  for h in $AGENT_HOSTS; do
+    [ "$(host_name "$h")" = "$1" ] && host_user "$h"
+  done
+}
+rex_endpoint_of() {
+  local user
+  user="$(host_user_of "$1")"
+  echo "ssh://${user:+$user@}$1"
+}
+host_has_rex() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$CUR_HOST" \
+    'test -x "$HOME/.local/bin/rex" || command -v rex' >/dev/null 2>&1
+}
+check_rex_host() {
+  rex hosts list --json 2>/dev/null | jq -e --arg n "$CUR_HOST" '
+    [.hosts[]?.host.label | ascii_downcase] | index($n | ascii_downcase) != null
+  ' >/dev/null
+}
+install_rex_host() { rex hosts add "$CUR_HOST" "$(rex_endpoint_of "$CUR_HOST")" >/dev/null; }
+
 # The Windows tasks that keep WSL up (windows/setup.ps1). A task whose saved
 # password no longer works (password changed, PC renamed) never starts and says
 # nothing, so each must have started in the last 15 minutes. Prints one line per
@@ -1516,6 +1558,7 @@ if [ "$ROLE" = host ]; then
   if [ "$SYSTEMD" = 1 ]; then
     step "old herdr TUI removed (server, binary, config, Claude hook)" check_no_herdr_tui install_no_herdr_tui
     step "hc terminals run without a login (linger)" check_linger   install_linger
+    step "Rex server (~/.local/bin/rex, starts on first connection)" check_rex_server install_rex_server
   fi
 fi
 
@@ -1571,6 +1614,13 @@ if [ "$ROLE" = client ]; then
       step "$CUR_HOST reachable over SSH"    check_ssh_reachable       install_ssh_reachable
       if have hc && check_ssh_reachable; then
         step "hc machine '$CUR_HOST' (shows in the Herdr app)" check_hc_machine install_hc_machine
+      fi
+      if have rex && check_ssh_reachable; then
+        if host_has_rex; then
+          step "Rex host '$CUR_HOST' (rex -S $CUR_HOST, Rex app)" check_rex_host install_rex_host
+        else
+          info "no Rex server on $CUR_HOST yet: run agent-box install there, then here again"
+        fi
       fi
     done
     for CUR_WIN in $(win_host_names); do
