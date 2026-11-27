@@ -148,6 +148,7 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 ### What the Linux install does on a host
 - `/etc/wsl.conf` on WSL: systemd on, Windows drives hidden from agents
 - Tailscale with **Tailscale SSH** (opens a login link the first time)
+- a Rex server for your account (`~/.local/bin/rex`, started by the `rex.socket` user unit); see [Rex on hosts](#rex-on-hosts)
 - what hc needs: linger, so hc's core and its terminals keep running after the last SSH login closes, and `claude` on the login shell's PATH (hc starts programs with the login environment). hc itself arrives from the Mac (`hc machine add --install`); its core runs as a systemd user service the app starts over SSH
 - the user's systemd manager (`user@<uid>.service`, where hc's core, its terminals, agents and their builds run) capped at 60% (throttled) / 70% (hard limit) of memory, so they can't take the host down
 - the old herdr TUI removed if an earlier agent-box installed it: its server unit, binary, `~/.config/herdr` and its Claude hook. hc and its folders are left alone
@@ -162,7 +163,7 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - the agent-box section in `~/.claude/CLAUDE.md`: shared instructions, secrets usage, and on hosts the dev-server rule
 - links for the shared skills, commands and agents from `claude/`
 
-On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) and an hc machine per host, which the Herdr app shows. A host must be on for the Mac to add it.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts, plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
 
 ## Tailscale admin console (once)
 - **Machines → each host → Disable key expiry**
@@ -201,7 +202,7 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 
 ## Rex on the Mac
 
-[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Agents run on the Mac only; hosts such as **pc** stay in the Herdr app.
+[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. Each host also runs a Rex server, and the Mac adds it as a Rex host reached over SSH, so `rex -S pc new myproject` or the Rex app opens sessions on **pc** (see [Rex on hosts](#rex-on-hosts)). The agent workflow below (`rex-agent`, `rex-task`) still runs agents on the Mac only.
 
 Claude Code reports its state to Rex itself (Program Status Protocol), so tabs show a spinner while an agent works and the session picker marks agents that are blocked or done. The pieces on top:
 
@@ -217,6 +218,19 @@ All four are also in the command palette under **Agents**. A shortcut recorded i
 From a shell or an agent: `rex-agent list|get|read|prompt|send-keys|wait|focus|open` and `rex-task new|rm` (`--help` on each). The `rex-placement` skill uses them; inside the Herdr app, `herdr-placement` (in the herdr-setup repo, with the Herdr layout) applies instead.
 
 Turn on **Remote Control** in Rex's settings (Rex Server) so commands run from a terminal, like `rex-task` or a history resume, can switch the app to the new session. Keys work without it.
+
+### Rex on hosts
+
+On a host, `agent-box install` installs Rex's Linux server for your account only (`curl … install.sh | sh -s -- --user --channel preview`, no sudo) into `~/.local/bin/rex`, and `rex server install` enables the `rex.socket` user unit, so the server starts on the first connection and keeps running after logout (linger). It needs no port: the Mac connects over the same SSH as hc.
+
+On the Mac, `agent-box install` adds each host that has a Rex server with `rex hosts add <host> ssh://<user>@<host>`. Then:
+
+```sh
+rex -S pc ls
+rex -S pc new myproject
+```
+
+hc and the Herdr app keep working beside it, so you can move over gradually. Rex on Linux is still in testing.
 
 ## Autonomous mode
 
