@@ -572,12 +572,13 @@ check_gh_protocol() { [ "$(gh config get -h github.com git_protocol 2>/dev/null)
 install_gh_protocol() { gh config set -h github.com git_protocol ssh; }
 
 # The first default key ssh offers, if any.
+# The public key of the Proton SSH agent (the agents' vault key), written to a file for gh.
 github_pubkey() {
-  local k
-  for k in id_ed25519 id_ecdsa id_rsa; do
-    [ -f "$HOME/.ssh/$k.pub" ] && { echo "$HOME/.ssh/$k.pub"; return 0; }
-  done
-  return 1
+  local pub="$HOME/.ssh/pub/agents-vault.pub"
+  [ -S "$SSH_AGENT_SOCKET" ] || return 1
+  mkdir -p "$(dirname "$pub")" || return 1
+  SSH_AUTH_SOCK="$SSH_AGENT_SOCKET" ssh-add -L 2>/dev/null | head -n 1 > "$pub"
+  [ -s "$pub" ] && echo "$pub"
 }
 github_has_key() {
   local key
@@ -595,10 +596,11 @@ check_github_ssh() {
 install_github_ssh() {
   have gh && check_gh_auth || { info "needs gh logged in to GitHub first"; return 1; }
   local pub
+  # No local keys: a machine without the Proton SSH agent waits for it.
   if ! pub="$(github_pubkey)"; then
-    pub="$HOME/.ssh/id_ed25519.pub"
-    mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-    ssh-keygen -q -t ed25519 -N "" -C "agent-box $(hostname)" -f "${pub%.pub}" || return 1
+    info "the key comes from the Proton SSH agent: install the dotfiles (they link pp),"
+    info "then run agent-box install again"
+    return 1
   fi
   if ! gh api user/keys >/dev/null 2>&1; then
     need_tty || return 1
@@ -611,7 +613,7 @@ install_github_ssh() {
   fi
   ssh -T -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
     git@github.com </dev/null >/dev/null 2>&1
-  check_github_ssh || info "$pub is on GitHub but ssh can't use it; if it has a passphrase, ssh-add it"
+  check_github_ssh || info "$pub is on GitHub but ssh can't use it; check the pp package's ssh config"
   return 0
 }
 
@@ -1566,15 +1568,6 @@ if [ "$ROLE" = host ] && [ "$SYSTEMD" = 1 ]; then
   fi
 fi
 
-section "GitHub"
-step "GitHub CLI (gh)"                    check_gh                  install_gh
-if have gh; then
-  step "gh logged in to GitHub"           check_gh_auth             install_gh_auth
-  step "gh uses SSH for git"              check_gh_protocol         install_gh_protocol
-fi
-step "git over SSH to GitHub"             check_github_ssh          install_github_ssh
-step "git name and email"                 check_git_identity        install_git_identity
-
 section "Secrets (Proton Pass)"
 step "pass-cli"                           check_pass_cli            install_pass_cli
 step "Proton Pass token stored (pst_…::…)" check_token             install_token
@@ -1589,6 +1582,19 @@ if have pass-cli && check_token && check_pp; then
     step "SSH agent for $PASS_VAULT vault keys (~/.ssh/proton-agents.sock)" check_ssh_agent install_ssh_agent
   fi
 fi
+
+# After the secrets: git's SSH key comes from the Proton SSH agent. Until it works (a new
+# machine, before the dotfiles link pp), gh keeps cloning over HTTPS.
+section "GitHub"
+step "GitHub CLI (gh)"                    check_gh                  install_gh
+if have gh; then
+  step "gh logged in to GitHub"           check_gh_auth             install_gh_auth
+fi
+step "git over SSH to GitHub (key from Proton Pass)" check_github_ssh install_github_ssh
+if have gh && check_github_ssh; then
+  step "gh uses SSH for git"              check_gh_protocol         install_gh_protocol
+fi
+step "git name and email"                 check_git_identity        install_git_identity
 
 if [ "$ROLE" = client ]; then
   section "Hosts"

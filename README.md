@@ -267,11 +267,11 @@ hc and the Herdr app keep working beside it, so you can move over gradually. Rex
 
 ## GitHub
 
-Every machine pushes over SSH with its **own** key, so if one machine is lost you delete only its key under **GitHub → Settings → SSH keys** (titled `agent-box <hostname>`). Each part is checked first and left alone if it already works:
+Every machine pushes over SSH with the key in the agents' Proton Pass vault, served by the Proton SSH agent (see Secrets). No machine keeps a private key on disk, so a lost machine is cut off by revoking its Proton Pass token; the key on GitHub stays. Each part is checked first and left alone if it already works:
 
 1. `gh` installed and logged in (`gh auth login`, browser or device code).
-2. `gh` set to use SSH for git, so `gh repo clone` gives SSH remotes.
-3. `ssh -T git@github.com` authenticates. If it already does (any key, ssh-agent, Keychain), nothing changes. Otherwise it uses `~/.ssh/id_ed25519` (or `id_ecdsa` / `id_rsa`), creates an ed25519 key without a passphrase if there is none, and uploads it with `gh ssh-key add`. Uploading needs the `admin:public_key` scope; `gh` asks for it once if your login lacks it.
+2. `ssh -T git@github.com` authenticates through the agent. If it doesn't, the vault key's public half is uploaded with `gh ssh-key add` (needs the `admin:public_key` scope; `gh` asks for it once). On a new machine the agent arrives with the dotfiles, which link `pp`: until then this step waits, and gh clones over HTTPS.
+3. `gh` set to use SSH for git, once SSH works, so `gh repo clone` gives SSH remotes.
 4. `git config --global user.name` and `user.email`, only if unset: your GitHub name and your `…@users.noreply.github.com` address.
 
 The keys have no passphrase so agents can push with nobody at the keyboard. They are deliberately not kept in Proton Pass: the stored agent token would unlock them just as easily, and a per-machine key is quicker to revoke than a shared one.
