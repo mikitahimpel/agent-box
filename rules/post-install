@@ -7,6 +7,11 @@ emil=(animation-vocabulary apple-design emil-design-eng
   find-animation-opportunities improve-animations review-animations)
 
 if [[ "$(uname)" == Darwin ]]; then
+  # The CLI behind the ios-simulator and agent-device skills. Not a Brewfile npm line:
+  # brew bundle runs npm with its own PATH, which has no node from fnm.
+  if ! npm ls -g --depth 0 agent-device >/dev/null 2>&1; then
+    npm install -g --silent agent-device
+  fi
   npx -y skills add callstack/agent-device -g -y -a claude-code -s agent-device ios-simulator
 fi
 npx -y skills add emilkowalski/skills -g -y -a claude-code -s "${emil[@]}"

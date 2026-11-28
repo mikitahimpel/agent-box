@@ -19,7 +19,7 @@ Windows host: games · Agents off/on · WSL keepalive + hang watchdog · Wi-Fi w
 |---|---|---|
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks. |
-| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill, and other people's skills (post-install) |
+| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill; its post-install adds other people's skills and `agent-device` |
 | `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
 | `host/` | hosts | Package: the dev-server rule |
@@ -92,7 +92,7 @@ Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -
 | `install.sh`, `install.ps1` | everywhere / Windows | The one-line installers above |
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks |
-| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill, and other people's skills (post-install) |
+| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill; its post-install adds other people's skills and `agent-device` |
 | `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
 | `host/` | hosts | Package: the dev-server rule |
