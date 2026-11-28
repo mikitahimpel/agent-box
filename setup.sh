@@ -403,10 +403,29 @@ install_pp_works() {
   check_pp_works
 }
 
-# Every machine: an always-on SSH agent with the SSH keys in the agents' vault,
+# This machine's Proton Pass vault, "Machine <name>": the secrets of this machine only,
+# its SSH key among them. Its agent can open just this one, so it is the one it sees.
+MACHINE_VAULT=""
+find_machine_vault() {
+  PROTON_PASS_AGENT_REASON="find this machine's vault" "$BIN_DIR/pp" vault list 2>/dev/null \
+    | sed -n 's/^- \[[^]]*\]: \(Machine .*\)$/\1/p'
+}
+check_machine_vault() {
+  local vaults
+  vaults="$(find_machine_vault)"
+  [ -n "$vaults" ] && [ "$(printf '%s\n' "$vaults" | wc -l)" -eq 1 ] || return 1
+  MACHINE_VAULT="$vaults"
+}
+install_machine_vault() {
+  info "this machine's Proton Pass agent needs exactly one vault named 'Machine <name>'"
+  info "with an SSH key in it; create and grant it with the admin session (see README)"
+  return 1
+}
+
+# Every machine: an always-on SSH agent with the SSH key in this machine's vault,
 # started through pp so it logs the shared session back in when it expires. The pp
 # package's ssh config points ssh at it (`IdentityAgent ~/.ssh/proton-agents.sock`),
-# so no machine keeps a private key on disk. A launchd agent on the Mac, a systemd
+# so no machine keeps a private key on disk, and each machine has a key of its own. A launchd agent on the Mac, a systemd
 # user service on Linux.
 SSH_AGENT_LABEL="dev.agent-box.proton-ssh-agent"
 SSH_AGENT_PLIST="$HOME/Library/LaunchAgents/$SSH_AGENT_LABEL.plist"
@@ -416,7 +435,7 @@ ssh_agent_plist() {
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Managed by agent-box. SSH agent for the keys in the "$PASS_VAULT" vault. -->
+<!-- Managed by agent-box. SSH agent for the keys in the "$MACHINE_VAULT" vault. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -425,14 +444,14 @@ ssh_agent_plist() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>rm -f "$SSH_AGENT_SOCKET"; exec "$BIN_DIR/pp" ssh-agent start --vault-name "$PASS_VAULT" --socket-path "$SSH_AGENT_SOCKET"</string>
+    <string>rm -f "$SSH_AGENT_SOCKET"; exec "$BIN_DIR/pp" ssh-agent start --vault-name "$MACHINE_VAULT" --socket-path "$SSH_AGENT_SOCKET"</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>$BIN_DIR:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>PROTON_PASS_AGENT_REASON</key>
-    <string>SSH agent for $PASS_VAULT vault keys</string>
+    <string>SSH agent for $MACHINE_VAULT keys</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -463,15 +482,15 @@ SSH_AGENT_SERVICE="agent-box-proton-ssh-agent.service"
 SSH_AGENT_UNIT="$HOME/.config/systemd/user/$SSH_AGENT_SERVICE"
 ssh_agent_unit() {
   cat <<EOF
-# Managed by agent-box. SSH agent for the keys in the "$PASS_VAULT" vault.
+# Managed by agent-box. SSH agent for the keys in the "$MACHINE_VAULT" vault.
 [Unit]
-Description=SSH agent for the $PASS_VAULT vault keys (Proton Pass)
+Description=SSH agent for the $MACHINE_VAULT keys (Proton Pass)
 
 [Service]
 Environment=PATH=$BIN_DIR:/usr/local/bin:/usr/bin:/bin
-Environment="PROTON_PASS_AGENT_REASON=SSH agent for $PASS_VAULT vault keys"
+Environment="PROTON_PASS_AGENT_REASON=SSH agent for $MACHINE_VAULT keys"
 ExecStartPre=/bin/rm -f $SSH_AGENT_SOCKET
-ExecStart=$BIN_DIR/pp ssh-agent start --vault-name $PASS_VAULT --socket-path $SSH_AGENT_SOCKET
+ExecStart=$BIN_DIR/pp ssh-agent start --vault-name "$MACHINE_VAULT" --socket-path $SSH_AGENT_SOCKET
 Restart=always
 RestartSec=30
 
@@ -572,9 +591,9 @@ check_gh_protocol() { [ "$(gh config get -h github.com git_protocol 2>/dev/null)
 install_gh_protocol() { gh config set -h github.com git_protocol ssh; }
 
 # The first default key ssh offers, if any.
-# The public key of the Proton SSH agent (the agents' vault key), written to a file for gh.
+# The public key of the Proton SSH agent (this machine's key), written to a file for gh.
 github_pubkey() {
-  local pub="$HOME/.ssh/pub/agents-vault.pub"
+  local pub="$HOME/.ssh/pub/machine.pub"
   [ -S "$SSH_AGENT_SOCKET" ] || return 1
   mkdir -p "$(dirname "$pub")" || return 1
   SSH_AUTH_SOCK="$SSH_AGENT_SOCKET" ssh-add -L 2>/dev/null | head -n 1 > "$pub"
@@ -609,7 +628,7 @@ install_github_ssh() {
     gh auth refresh -h github.com -s admin:public_key || return 1
   fi
   if ! github_has_key "$pub"; then
-    gh ssh-key add "$pub" --title "agent-box $(hostname)" || return 1
+    gh ssh-key add "$pub" --title "${MACHINE_VAULT:-agent-box $(hostname)}" || return 1
   fi
   ssh -T -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 \
     git@github.com </dev/null >/dev/null 2>&1
@@ -1579,7 +1598,9 @@ step "pp (pp package)"                    check_pp                  install_pp
 if have pass-cli && check_token && check_pp; then
   step "pp can log in"                    check_pp_works            install_pp_works
   if [ "$PLATFORM" = mac ] || has_systemd; then
-    step "SSH agent for $PASS_VAULT vault keys (~/.ssh/proton-agents.sock)" check_ssh_agent install_ssh_agent
+    if step "this machine's vault (Machine <name>)" check_machine_vault install_machine_vault; then
+      step "SSH agent for $MACHINE_VAULT keys (~/.ssh/proton-agents.sock)" check_ssh_agent install_ssh_agent
+    fi
   fi
 fi
 
