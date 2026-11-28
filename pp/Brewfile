@@ -1,0 +1,4 @@
+# pass-cli from Proton's tap: signed by Proton AG, so the Keychain keeps trusting it
+# across upgrades. homebrew-core's build is ad-hoc signed and loops Keychain prompts.
+tap "protonpass/tap"
+brew "protonpass/tap/pass-cli"

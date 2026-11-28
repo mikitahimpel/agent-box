@@ -73,7 +73,6 @@ OLD_HERDR_HOOK="$HOME/.claude/hooks/herdr-agent-state.sh"
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
-SHARED_CLAUDE="$REPO_DIR/claude"
 SHUTDOWN_FLAG="$HOME/.agent-box/shutdown"
 RESTART_FLAG="$HOME/.agent-box/restart"
 SSH_CONFIG="$HOME/.ssh/config"
@@ -149,6 +148,71 @@ block_matches() {
     $0 == e { inside = 0; next }
     inside
   ' "$1")" = "$2" ]
+}
+
+# ---------------------------------------------------------------- packages
+
+# Files (rules, skills, pp, Rex scripts) are stow packages in this repo: a package is a
+# folder whose home/ mirrors ~. On the Mac the dotfiles install links them; on a host,
+# which has no dotfiles yet, this script links its own packages.
+HOST_PACKAGES="rules pp host"
+
+check_stow() { have stow; }
+install_stow() { apt_install stow; }
+
+stow_package() {  # stow_package <package> [stow flags]
+  local package="$1"
+  shift
+  stow --no-folding "$@" -d "$REPO_DIR/$package" -t "$HOME" home
+}
+check_packages_linked() {
+  local package
+  for package in $HOST_PACKAGES; do
+    [ -z "$(stow_package "$package" -n -v 2>&1 | grep -E '^(LINK|UNLINK):')" ] || return 1
+  done
+}
+install_packages_linked() {
+  local package
+  for package in $HOST_PACKAGES; do
+    stow_package "$package" -R || return 1
+  done
+}
+
+# What agent-box installed before the packages: a generated pp, links into the old
+# claude/ and rex/ folders, and its block in ~/.claude/CLAUDE.md.
+OLD_LINKS="$CLAUDE_DIR/skills/agent-orchestrator $CLAUDE_DIR/skills/rex-placement
+  $BIN_DIR/rex-agent $BIN_DIR/rex-task ${XDG_CONFIG_HOME:-$HOME/.config}/rex/agents.lua"
+old_files() {
+  local link
+  for link in $OLD_LINKS; do
+    [ -L "$link" ] || continue
+    case "$(readlink "$link")" in */home/*) ;; *) echo "$link" ;; esac
+  done
+  if [ -f "$BIN_DIR/pp" ] && [ ! -L "$BIN_DIR/pp" ] \
+    && grep -q '^# Managed by agent-box' "$BIN_DIR/pp"; then
+    echo "$BIN_DIR/pp"
+  fi
+}
+check_no_old_files() {
+  [ -z "$(old_files)" ] && ! grep -qxF "$MARK_START" "$CLAUDE_MD" 2>/dev/null
+}
+install_no_old_files() {
+  local file tmp
+  for file in $(old_files); do rm -f "$file"; done
+  [ -f "$CLAUDE_MD" ] || return 0
+  tmp="$(mktemp)"
+  awk -v s="$MARK_START" -v e="$MARK_END" '
+    $0 == s { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip
+  ' "$CLAUDE_MD" | sed '/./,$!d' > "$tmp"
+  mv "$tmp" "$CLAUDE_MD"
+}
+
+check_pp() { [ -x "$BIN_DIR/pp" ]; }
+install_pp() {
+  info "pp comes from the pp package: on a Mac the dotfiles install links it"
+  return 1
 }
 
 # ---------------------------------------------------------------- platform
@@ -382,69 +446,6 @@ install_no_old_pass() {
   remove_old_token && rm -rf "$OLD_SESSION_DIR"
 }
 
-pp_script() {
-  cat <<EOF
-#!/usr/bin/env bash
-# pp: pass-cli that logs in with this machine's Proton Pass token when the session
-# has expired. Uses pass-cli's default session, shared with project tools.
-# Managed by agent-box; local edits are overwritten.
-set -euo pipefail
-export PATH="$BIN_DIR:\$PATH"
-export PROTON_PASS_AGENT_REASON="\${PROTON_PASS_AGENT_REASON:-agent on \$(hostname)}"
-# Same local key from every login session; see login_shell_block in agent-box.
-[[ "\$(uname)" == Darwin ]] || export PROTON_PASS_KEY_PROVIDER="\${PROTON_PASS_KEY_PROVIDER:-fs}"
-
-token() {
-  if [[ "\$(uname)" == Darwin ]]; then
-    security find-generic-password -s $TOKEN_SERVICE -a $TOKEN_ACCOUNT -w
-  else
-    if command -v secret-tool >/dev/null 2>&1 \\
-      && secret-tool lookup service $TOKEN_SERVICE account $TOKEN_ACCOUNT 2>/dev/null; then
-      return 0
-    fi
-    cat "\${XDG_CONFIG_HOME:-\$HOME/.config}/proton-pass/token"
-  fi
-}
-
-if ! pass-cli info >/dev/null 2>&1; then
-  PROTON_PASS_PERSONAL_ACCESS_TOKEN="\$(token)" pass-cli login >/dev/null
-fi
-
-exec pass-cli "\$@"
-EOF
-}
-check_pp() { [ -x "$BIN_DIR/pp" ] && pp_script | cmp -s - "$BIN_DIR/pp"; }
-install_pp() { mkdir -p "$BIN_DIR" && pp_script > "$BIN_DIR/pp" && chmod 755 "$BIN_DIR/pp"; }
-
-# The managed CLAUDE.md block: shared instructions from the repo, then the
-# generated sections. Rerun install after editing claude/CLAUDE.md.
-claude_md_block() {
-  if [ -s "$SHARED_CLAUDE/CLAUDE.md" ]; then
-    cat "$SHARED_CLAUDE/CLAUDE.md"
-    echo
-  fi
-  cat <<EOF
-## Secrets
-- Secrets live in Proton Pass vault "$PASS_VAULT". Never hardcode, log or print them.
-- Put references in .env files: \`API_KEY=pass://$PASS_VAULT/<item>/<field>\`
-- Run commands that need secrets via: \`pp run --env-file .env -- <command>\`
-- Set PROTON_PASS_AGENT_REASON to a short reason before reading secrets.
-- This machine has one Proton Pass session and token, shared by pp and project tools.
-  Don't set PROTON_PASS_SESSION_DIR, log in or out, or read the stored token.
-EOF
-  if [ "$ROLE" = host ]; then
-    cat <<EOF
-
-## Dev servers
-- This machine is reached over Tailscale as "$AGENT_HOST". Bind dev servers to 0.0.0.0
-  (for example \`--host 0.0.0.0\`) so they open from the user's other machines.
-- When a server is up, give the user its URL as http://$AGENT_HOST:<port>.
-EOF
-  fi
-}
-check_claude_md() { block_matches "$CLAUDE_MD" "$(claude_md_block)"; }
-install_claude_md() { replace_block "$CLAUDE_MD" "$(claude_md_block)"; }
-
 check_pp_works() { "$BIN_DIR/pp" info >/dev/null 2>&1; }
 # A session encrypted with a key from the old provider can't be opened; reset the
 # local state once and let pp log back in with the machine's token.
@@ -456,80 +457,6 @@ install_pp_works() {
     pass-cli logout --force >/dev/null 2>&1
   fi
   check_pp_works
-}
-
-# Shared skills, commands and agents live in claude/<kind>/<name> in this repo
-# and are symlinked into ~/.claude/<kind>/<name>.
-SHARED_KINDS="skills commands agents"
-shared_items() {
-  local kind item
-  for kind in $SHARED_KINDS; do
-    for item in "$SHARED_CLAUDE/$kind"/*; do
-      [ -e "$item" ] && echo "$kind/$(basename "$item")"
-    done
-  done
-}
-# Links into this repo whose target was deleted from the repo.
-stale_shared_links() {
-  local kind link target
-  for kind in $SHARED_KINDS; do
-    for link in "$CLAUDE_DIR/$kind"/*; do
-      [ -L "$link" ] || continue
-      target="$(readlink "$link")"
-      case "$target" in "$SHARED_CLAUDE/"*) [ -e "$target" ] || echo "$link" ;; esac
-    done
-  done
-}
-check_shared_claude() {
-  local rel
-  for rel in $(shared_items); do
-    [ "$(readlink "$CLAUDE_DIR/$rel" 2>/dev/null)" = "$SHARED_CLAUDE/$rel" ] || return 1
-  done
-  [ -z "$(stale_shared_links)" ]
-}
-install_shared_claude() {
-  local rel target link
-  for link in $(stale_shared_links); do rm -f "$link"; done
-  for rel in $(shared_items); do
-    target="$CLAUDE_DIR/$rel"
-    [ "$(readlink "$target" 2>/dev/null)" = "$SHARED_CLAUDE/$rel" ] && continue
-    if [ -e "$target" ] || [ -L "$target" ]; then
-      info "~/.claude/$rel exists and isn't from agent-box; move it into claude/$rel or delete it"
-      return 1
-    fi
-    mkdir -p "$(dirname "$target")" && ln -s "$SHARED_CLAUDE/$rel" "$target" || return 1
-  done
-}
-
-# Rex on the Mac: rex-agent and rex-task go to ~/.local/bin, and agents.lua
-# is linked beside the user's init.lua, which loads it with require("agents").
-REX_SUPPORT="$HOME/Library/Application Support/com.superlogical.rex"
-REX_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rex"
-REX_LINKS="bin/rex-agent:$BIN_DIR/rex-agent bin/rex-task:$BIN_DIR/rex-task config/agents.lua:$REX_CONFIG_DIR/agents.lua"
-check_rex_agents() {
-  local pair
-  for pair in $REX_LINKS; do
-    [ "$(readlink "${pair#*:}" 2>/dev/null)" = "$REPO_DIR/rex/${pair%%:*}" ] || return 1
-  done
-  grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null
-}
-install_rex_agents() {
-  local pair
-  for pair in $REX_LINKS; do
-    mkdir -p "$(dirname "${pair#*:}")" && ln -sfn "$REPO_DIR/rex/${pair%%:*}" "${pair#*:}" || return 1
-  done
-  if grep -q '^require("agents")' "$REX_CONFIG_DIR/init.lua" 2>/dev/null; then
-    have rex && rex config reload >/dev/null 2>&1
-    return 0
-  fi
-  # A linked init.lua belongs to the user's own dotfiles: never write through it.
-  if [ -L "$REX_CONFIG_DIR/init.lua" ]; then
-    info "~/.config/rex/init.lua links into your own config; add require(\"agents\") there"
-    return 1
-  fi
-  printf '%s\n' '-- Agent workflow from agent-box.' 'require("agents")' >> "$REX_CONFIG_DIR/init.lua"
-  have rex && rex config reload >/dev/null 2>&1
-  return 0
 }
 
 # Mac client: an always-on SSH agent with the SSH keys in the agents' vault,
@@ -591,7 +518,7 @@ install_ssh_agent() {
 # Hosts outside allowedDomains still prompt; add them to claude/allowed-domains.txt.
 autonomous_settings() {
   local domains
-  domains="$(grep -Ev '^[[:space:]]*(#|$)' "$SHARED_CLAUDE/allowed-domains.txt" 2>/dev/null | jq -R . | jq -s .)"
+  domains="$(grep -Ev '^[[:space:]]*(#|$)' "$REPO_DIR/setup/allowed-domains.txt" 2>/dev/null | jq -R . | jq -s .)"
   jq -n --argjson domains "${domains:-[]}" '{
     sandbox: {
       enabled: true,
@@ -1627,9 +1554,10 @@ fi
 
 section "Agents"
 step "Claude Code"                        check_claude              install_claude
-step "shared Claude config (claude/ in this repo)" check_shared_claude install_shared_claude
-if [ "$PLATFORM" = mac ] && [ -d "$REX_SUPPORT" ]; then
-  step "Rex agent workflow (rex/ in this repo)" check_rex_agents install_rex_agents
+step "old agent-box files and CLAUDE.md block removed" check_no_old_files install_no_old_files
+if [ "$ROLE" = host ]; then
+  step "stow"                             check_stow                install_stow
+  have stow && step "packages linked ($HOST_PACKAGES)" check_packages_linked install_packages_linked
 fi
 if [ "$PLATFORM" != mac ] && { [ "$ROLE" = host ] || [ "$AUTONOMOUS" = on ]; }; then
   step "Claude sandbox deps (bubblewrap, socat)" check_sandbox_deps install_sandbox_deps
@@ -1680,8 +1608,7 @@ if [ "$MODE" = check ] && ! check_token && has_old_token; then
   info "found the token of an older agent-box; install moves it"
 fi
 step "no old agent-box token or pp session" check_no_old_pass       install_no_old_pass
-step "pp wrapper"                         check_pp                  install_pp
-step "CLAUDE.md agent-box section"        check_claude_md           install_claude_md
+step "pp (pp package)"                    check_pp                  install_pp
 if have pass-cli && check_token && check_pp; then
   step "pp can log in"                    check_pp_works            install_pp_works
   if [ "$PLATFORM" = mac ] && [ "$ROLE" = client ]; then

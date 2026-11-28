@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# The parts of agent-box that are machine state, not files: the Proton Pass token,
+# Tailscale, hosts, the SSH agent, GitHub. See setup.sh.
+set -euo pipefail
+exec "$(cd "$(dirname "$0")/.." && pwd)/setup.sh" install
