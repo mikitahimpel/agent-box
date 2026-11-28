@@ -3,7 +3,6 @@
 #
 #   agent-box               check only, change nothing (same as ./setup.sh)
 #   agent-box install       install or fix everything that is missing
-#   agent-box sync          git pull this repo, then install
 #   agent-box off [host]    shut a host down (default: this host, or the first on a client)
 #   agent-box restart [host]  restart a host (same default)
 #   agent-box add [user@]address [--host name]
@@ -152,66 +151,11 @@ block_matches() {
 
 # ---------------------------------------------------------------- packages
 
-# Files (rules, skills, pp, Rex scripts) are stow packages in this repo: a package is a
-# folder whose home/ mirrors ~. On the Mac the dotfiles install links them; on a host,
-# which has no dotfiles yet, this script links its own packages.
-HOST_PACKAGES="rules pp host"
-
-check_stow() { have stow; }
-install_stow() { apt_install stow; }
-
-stow_package() {  # stow_package <package> [stow flags]
-  local package="$1"
-  shift
-  stow --no-folding "$@" -d "$REPO_DIR/$package" -t "$HOME" home
-}
-check_packages_linked() {
-  local package
-  for package in $HOST_PACKAGES; do
-    [ -z "$(stow_package "$package" -n -v 2>&1 | grep -E '^(LINK|UNLINK):')" ] || return 1
-  done
-}
-install_packages_linked() {
-  local package
-  for package in $HOST_PACKAGES; do
-    stow_package "$package" -R || return 1
-  done
-}
-
-# What agent-box installed before the packages: a generated pp, links into the old
-# claude/ and rex/ folders, and its block in ~/.claude/CLAUDE.md.
-OLD_LINKS="$CLAUDE_DIR/skills/agent-orchestrator $CLAUDE_DIR/skills/rex-placement
-  $BIN_DIR/rex-agent $BIN_DIR/rex-task ${XDG_CONFIG_HOME:-$HOME/.config}/rex/agents.lua"
-old_files() {
-  local link
-  for link in $OLD_LINKS; do
-    [ -L "$link" ] || continue
-    case "$(readlink "$link")" in */home/*) ;; *) echo "$link" ;; esac
-  done
-  if [ -f "$BIN_DIR/pp" ] && [ ! -L "$BIN_DIR/pp" ] \
-    && grep -q '^# Managed by agent-box' "$BIN_DIR/pp"; then
-    echo "$BIN_DIR/pp"
-  fi
-}
-check_no_old_files() {
-  [ -z "$(old_files)" ] && ! grep -qxF "$MARK_START" "$CLAUDE_MD" 2>/dev/null
-}
-install_no_old_files() {
-  local file tmp
-  for file in $(old_files); do rm -f "$file"; done
-  [ -f "$CLAUDE_MD" ] || return 0
-  tmp="$(mktemp)"
-  awk -v s="$MARK_START" -v e="$MARK_END" '
-    $0 == s { skip = 1; next }
-    $0 == e { skip = 0; next }
-    !skip
-  ' "$CLAUDE_MD" | sed '/./,$!d' > "$tmp"
-  mv "$tmp" "$CLAUDE_MD"
-}
-
+# Files (rules, skills, pp, Rex scripts) are stow packages in this repo. The dotfiles
+# install links them on every machine, then runs this script for the machine state.
 check_pp() { [ -x "$BIN_DIR/pp" ]; }
 install_pp() {
-  info "pp comes from the pp package: on a Mac the dotfiles install links it"
+  info "pp comes from the pp package, which the dotfiles install links"
   return 1
 }
 
@@ -1428,6 +1372,7 @@ add_host() {
   echo "Setting up $addr as host '$name'"
   ssh -t "$@" "$addr" "~/$base/setup.sh install --role host --host $name" \
     || echo "Some host steps didn't finish; rerun 'agent-box install' on $name later."
+  echo "Then install the dotfiles on $name: they link the rules, pp and host packages."
   ssh "$@" -O exit "$addr" 2>/dev/null
 
   entry="$remote_user@$name"
@@ -1444,11 +1389,9 @@ add_host() {
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SCRIPT"; }
 
 OFF_TARGET="" POWER_ACTION="" HOST_ARG="" ADD_TARGET="" ADD_NAME=""
-ORIG_ARGS=()
-for _a in "$@"; do [ "$_a" = sync ] || ORIG_ARGS+=("$_a"); done
 while [ $# -gt 0 ]; do
   case "$1" in
-    check|install|sync) MODE="$1" ;;
+    check|install) MODE="$1" ;;
     add) MODE=add; case "${2:-}" in ""|-*) ;; *) ADD_TARGET="$2"; shift ;; esac ;;
     off|restart) MODE=power; POWER_ACTION="$1"; case "${2:-}" in ""|-*) ;; *) OFF_TARGET="$2"; shift ;; esac ;;
     _shutdown-pending) shutdown_pending; exit $? ;;
@@ -1477,7 +1420,7 @@ if [ "$ROLE" = host ]; then
   [ -n "$AGENT_HOST" ] || AGENT_HOST="$(current_ts_name)"
   if [ -z "$AGENT_HOST" ]; then
     _default="$(hostname -s | tr '[:upper:]' '[:lower:]')"
-    case "$MODE" in install|sync)
+    case "$MODE" in install)
       if [ -t 0 ]; then
         printf 'Name for this machine (your other machines reach it by this name) [%s]: ' "$_default"
         read -r AGENT_HOST
@@ -1514,11 +1457,6 @@ if [ "$MODE" = power ]; then
   request_power "$POWER_ACTION" "$OFF_TARGET"
   exit 0
 fi
-if [ "$MODE" = sync ]; then
-  git -C "$REPO_DIR" pull --ff-only || die "git pull failed in $REPO_DIR"
-  # Bash has already read part of the old script, so run the updated one.
-  exec "$SCRIPT" install "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
-fi
 
 printf 'agent-box · %s · role: %s · autonomous: %s · mode: %s\n' "$PLATFORM" "$ROLE" "$AUTONOMOUS" "$MODE"
 
@@ -1554,11 +1492,6 @@ fi
 
 section "Agents"
 step "Claude Code"                        check_claude              install_claude
-step "old agent-box files and CLAUDE.md block removed" check_no_old_files install_no_old_files
-if [ "$ROLE" = host ]; then
-  step "stow"                             check_stow                install_stow
-  have stow && step "packages linked ($HOST_PACKAGES)" check_packages_linked install_packages_linked
-fi
 if [ "$PLATFORM" != mac ] && { [ "$ROLE" = host ] || [ "$AUTONOMOUS" = on ]; }; then
   step "Claude sandbox deps (bubblewrap, socat)" check_sandbox_deps install_sandbox_deps
   have bwrap && step "bubblewrap can create sandboxes" check_bwrap_works install_bwrap_works

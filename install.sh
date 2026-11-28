@@ -3,20 +3,23 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/mikitahimpel/agent-box/main/install.sh | bash
 #
-# Gets agent-box into ~/agent-box (or updates the copy this machine already
-# uses) and runs `setup.sh install`. Safe to rerun. Arguments after
-# `bash -s --` are passed on to setup.sh.
+# The first step on a new machine: gets agent-box into ~/.local/share/packages/agent-box,
+# where the dotfiles install keeps it, and runs `setup.sh install` for the machine state
+# (GitHub login, Proton Pass token, Tailscale). Then install the dotfiles, which link the
+# packages and update agent-box from then on. Safe to rerun: on a machine that has
+# agent-box already, it runs `agent-box install`. Arguments after `bash -s --` are passed
+# on to setup.sh.
 
 set -euo pipefail
 
 # Everything is inside main so a partial download runs nothing.
 main() {
   local repo="https://github.com/mikitahimpel/agent-box.git"
-  local dir="${AGENT_BOX_DIR:-$HOME/agent-box}"
+  local dir="${AGENT_BOX_DIR:-$HOME/.local/share/packages/agent-box}"
   local cmd
 
   if [ -L "$HOME/.local/bin/agent-box" ]; then
-    cmd=("$HOME/.local/bin/agent-box" sync "$@")
+    cmd=("$HOME/.local/bin/agent-box" install "$@")
   else
     if ! command -v git >/dev/null 2>&1; then
       case "$(uname -s)" in
@@ -27,9 +30,8 @@ main() {
         *) sudo apt-get update -qq && sudo apt-get install -y -qq git ;;
       esac
     fi
-    if [ -d "$dir/.git" ]; then
-      git -C "$dir" pull --ff-only
-    else
+    if [ ! -d "$dir/.git" ]; then
+      mkdir -p "$(dirname "$dir")"
       git clone -q "$repo" "$dir"
     fi
     cmd=("$dir/setup.sh" install "$@")
