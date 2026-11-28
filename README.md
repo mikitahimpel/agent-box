@@ -20,7 +20,7 @@ Windows host: games · Agents off/on · WSL keepalive + hang watchdog · Wi-Fi w
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks. |
 | `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill; its post-install adds other people's skills and `agent-device` |
-| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
+| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that sends ssh to the Proton SSH agent |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
 | `host/` | hosts | Package: the dev-server rule |
 | `setup/` | every machine | Package without files: its post-install runs `setup.sh install` |
@@ -97,7 +97,7 @@ Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks |
 | `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill; its post-install adds other people's skills and `agent-device` |
-| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
+| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that sends ssh to the Proton SSH agent |
 | `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
 | `host/` | hosts | Package: the dev-server rule |
 | `setup/` | every machine | Package without files: its post-install runs `setup.sh install` |
@@ -180,12 +180,12 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - GitHub: `gh`, git over SSH, and your git name and email
 - Proton Pass CLI and this machine's Proton Pass token (asked once)
 - the same always-on SSH agent as on the Mac, as the systemd user service
-  `agent-box-proton-ssh-agent`: ssh uses the keys in the agents' vault through
-  `~/.ssh/proton-agents.sock`, so the host keeps no private key of its own
+  `agent-box-proton-ssh-agent`: ssh uses the key in this machine's vault (`Machine <name>`)
+  through `~/.ssh/proton-agents.sock`, so the host keeps no private key on disk
 - the rules, skills, `pp` and `artifact-dir` come from the `rules`, `pp` and `host` packages,
   which the dotfiles install links
 
-On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts (`pass-cli` from Proton's Homebrew tap, whose signed build keeps its Keychain access across upgrades), an always-on SSH agent with the SSH keys in the agents' vault (launchd `dev.agent-box.proton-ssh-agent`, socket `~/.ssh/proton-agents.sock`; point ssh at it with `IdentityAgent`), plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
+On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts (`pass-cli` from Proton's Homebrew tap, whose signed build keeps its Keychain access across upgrades), an always-on SSH agent with the SSH key in this machine's vault, `Machine <name>` (launchd `dev.agent-box.proton-ssh-agent`, socket `~/.ssh/proton-agents.sock`; point ssh at it with `IdentityAgent`), plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
 
 ## Tailscale admin console (once)
 - **Machines → each host → Disable key expiry**
@@ -267,11 +267,11 @@ hc and the Herdr app keep working beside it, so you can move over gradually. Rex
 
 ## GitHub
 
-Every machine pushes over SSH with its **own** key, so if one machine is lost you delete only its key under **GitHub → Settings → SSH keys** (titled `agent-box <hostname>`). Each part is checked first and left alone if it already works:
+Every machine pushes over SSH with its own key, kept in its Proton Pass vault `Machine <name>` and served by the Proton SSH agent (see Secrets). No machine keeps a private key on disk. A lost machine is cut off by revoking its Proton Pass agent and deleting its key under **GitHub → Settings → SSH keys** (titled after the vault). Each part is checked first and left alone if it already works:
 
 1. `gh` installed and logged in (`gh auth login`, browser or device code).
-2. `gh` set to use SSH for git, so `gh repo clone` gives SSH remotes.
-3. `ssh -T git@github.com` authenticates. If it already does (any key, ssh-agent, Keychain), nothing changes. Otherwise it uses `~/.ssh/id_ed25519` (or `id_ecdsa` / `id_rsa`), creates an ed25519 key without a passphrase if there is none, and uploads it with `gh ssh-key add`. Uploading needs the `admin:public_key` scope; `gh` asks for it once if your login lacks it.
+2. `ssh -T git@github.com` authenticates through the agent. If it doesn't, the machine key's public half is uploaded with `gh ssh-key add` (needs the `admin:public_key` scope; `gh` asks for it once). On a new machine the agent arrives with the dotfiles, which link `pp`: until then this step waits, and gh clones over HTTPS.
+3. `gh` set to use SSH for git, once SSH works, so `gh repo clone` gives SSH remotes.
 4. `git config --global user.name` and `user.email`, only if unset: your GitHub name and your `…@users.noreply.github.com` address.
 
 The keys have no passphrase so agents can push with nobody at the keyboard. They are deliberately not kept in Proton Pass: the stored agent token would unlock them just as easily, and a per-machine key is quicker to revoke than a shared one.
@@ -293,13 +293,20 @@ Which vaults the token covers depends on the machine:
 
 | Machine | Vaults |
 |---|---|
-| Your Mac (client) | `Agents` and your project vaults, release vaults included (e.g. `Memoxia`, `Memoxia Release`) |
-| A host (the PC, a Pi) | `Agents` and your project dev vaults (e.g. `Memoxia`), **never** release vaults |
+| Your Mac (client) | `Agents`, its own `Machine <name>` vault, and your project vaults, release vaults included (e.g. `Memoxia`, `Memoxia Release`) |
+| A host (the PC, a Pi) | `Agents`, its own `Machine <name>` vault, and your project dev vaults (e.g. `Memoxia`), **never** release vaults |
 | An external contributor | only the project's vault (e.g. `Memoxia`) |
 
 1. In **pass.proton.me → Settings → Access tokens → New token**, create the machine's token: named after the machine, expiry 1 year, the vaults above, **Use for AI agent** on. The install prints the vaults to pick; `--token-vaults "Agents,Memoxia"` makes it name exact vaults.
 2. The install asks for the token once and stores it as above.
 3. `pp` wraps `pass-cli` from your PATH. Agent sessions last 2 hours; when `pass-cli info` fails, `pp` logs back in with `PROTON_PASS_PERSONAL_ACCESS_TOKEN=<token> pass-cli login`. Every read is labelled with `PROTON_PASS_AGENT_REASON` (default `agent on <hostname>`).
+
+**This machine's vault.** Secrets that belong to one machine only live in its own vault, named `Machine <name>` (`Machine MacBook`, `Machine PC`); only that machine's token can open it. Its SSH key is one of them: the Proton SSH agent serves it, and `agent-box install` finds the vault as the only `Machine …` vault the token sees. For a new machine, with the admin session:
+```bash
+pass-cli vault create --name "Machine <Name>"
+pass-cli item create ssh-key generate --vault-name "Machine <Name>" --title "SSH <Name>" --comment "<name>"
+pass-cli agent access grant "<agent name>" --vault-name "Machine <Name>"
+```
 
 Agents use it like this (the secrets rule in `~/.claude/rules/` tells them to):
 ```bash
