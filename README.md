@@ -177,8 +177,11 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - self-hosted GitHub runners (`gh-runner*`, `actions.runner*` services), if there are any: moved into their own slice with at most 50% of memory, 1GB of swap, and a lower CPU and disk weight than agents. These are weights, not quotas: CI uses the whole machine when it's idle, and yields when agents or hc need it. A job that needs more memory fails instead of swapping the host to a crawl (there is no MemoryHigh: throttling at it stalled jobs for an hour instead of failing them). Their units stop with `KillMode=mixed`, so a restart can't leave an orphaned listener holding the runner's GitHub session; runners already orphaned that way are restarted. It never creates or removes runners, and restarts them only when no job runs.
 - a watchdog for those runners: every minute, the steps of a pull-request job older than 30 minutes are stopped, so the job fails instead of holding a runner for hours. Deploys and manual runs are never stopped (`journalctl -t agent-box-runner-watchdog`).
 - Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
-- GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
+- GitHub: `gh`, git over SSH, and your git name and email
 - Proton Pass CLI and this machine's Proton Pass token (asked once)
+- the same always-on SSH agent as on the Mac, as the systemd user service
+  `agent-box-proton-ssh-agent`: ssh uses the keys in the agents' vault through
+  `~/.ssh/proton-agents.sock`, so the host keeps no private key of its own
 - the rules, skills, `pp` and `artifact-dir` come from the `rules`, `pp` and `host` packages,
   which the dotfiles install links
 
