@@ -29,14 +29,19 @@ Windows host: games · Agents off/on · WSL keepalive + hang watchdog · Wi-Fi w
 
 Files live in [stow](https://www.gnu.org/software/stow/) packages: a package is a folder whose
 `home/` mirrors `~`, with an optional `Brewfile` for its dependencies and an optional
-`post-install`. On the Mac the [dotfiles](https://github.com/mikitahimpel/dotfiles) install
-links them from its package list (`rules pp rex setup`). A host has no dotfiles yet, so
-`setup.sh` links `rules pp host` itself. `setup.sh` keeps only machine state: the Proton Pass
-token, Tailscale, hosts, the SSH agent, GitHub, and on hosts systemd and memory limits.
+`post-install`. The [dotfiles](https://github.com/mikitahimpel/dotfiles) install links them
+on every machine from its package list (Mac: `rules pp rex setup`, pc: `rules pp host
+setup`), and updates them with `dotfiles update`. The `setup` package's post-install runs
+`setup.sh install`, which keeps only machine state: the Proton Pass token, Tailscale, hosts,
+the SSH agent, GitHub, and on hosts systemd and memory limits.
 
 ## Install
 
-One command per machine, the same command every time: to set up, to fix, to update. It downloads agent-box, works out what the machine is, and asks only for what it can't find out (logins, tokens, a name).
+Two steps on a new machine. First the command below: it downloads agent-box, works out what the machine is, and sets up the machine state, asking only for what it can't find out (logins, tokens, a name). Then the dotfiles, which link the packages and keep agent-box updated:
+
+```bash
+gh repo clone mikitahimpel/dotfiles ~/.dotfiles && ~/.dotfiles/install.sh pc   # or mac
+```
 
 **macOS, Linux, WSL, Raspberry Pi:**
 ```bash
@@ -65,7 +70,6 @@ Afterwards the machine has the `agent-box` command:
 ```bash
 agent-box                  # check what's missing (changes nothing)
 agent-box install          # fix
-agent-box sync             # update agent-box, then install (what the one-liner does)
 agent-box off [host]       # shut a host down remotely
 agent-box restart [host]   # restart a host remotely
 agent-box add user@address # set up a Linux machine on your network from the Mac, over plain SSH
@@ -175,8 +179,8 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
 - Proton Pass CLI and this machine's Proton Pass token (asked once)
-- `stow`, and links for the `rules`, `pp` and `host` packages: the rules in `~/.claude/rules/`,
-  the skills, `pp` and `artifact-dir`
+- the rules, skills, `pp` and `artifact-dir` come from the `rules`, `pp` and `host` packages,
+  which the dotfiles install links
 
 On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts (`pass-cli` from Proton's Homebrew tap, whose signed build keeps its Keychain access across upgrades), an always-on SSH agent with the SSH keys in the agents' vault (launchd `dev.agent-box.proton-ssh-agent`, socket `~/.ssh/proton-agents.sock`; point ssh at it with `IdentityAgent`), plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
 
@@ -211,7 +215,7 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 | Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. `agent-box off pi` for the Pi. |
 | Restart | `agent-box restart` from the Mac (Windows restarts within ~2 min and comes back on its own). |
 | Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
-| Change rules or skills | Edit the package, merge, then `dotfiles update` on the Mac and `agent-box sync` on each host. |
+| Change rules or skills | Edit the package, merge, then `dotfiles update` on each machine (`ssh -t pc dotfiles update` from the Mac). |
 | Game | **Agents off** on the PC's desktop first; **Agents on** (or the next power-on) brings them back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
 
@@ -254,7 +258,7 @@ hc and the Herdr app keep working beside it, so you can move over gradually. Rex
 - **Sandbox on:** Bash commands run inside Claude's sandbox (bubblewrap on Linux/WSL, built in on macOS) and need no approval.
 - **No escape:** commands can't fall back to running outside the sandbox, and Claude refuses to start if the sandbox is unavailable instead of silently running without it.
 - **Edits auto-approved:** file edits don't ask (`acceptEdits`).
-- **Network allowlist:** sandboxed commands may reach the hosts in [setup/allowed-domains.txt](setup/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file and run `agent-box sync`.
+- **Network allowlist:** sandboxed commands may reach the hosts in [setup/allowed-domains.txt](setup/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file, merge, and run `dotfiles update`.
 
 `--autonomous off` stops managing these settings but doesn't remove them. Undo with `/sandbox` inside Claude or by restoring `settings.json.bak`.
 
