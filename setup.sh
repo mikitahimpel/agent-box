@@ -403,9 +403,11 @@ install_pp_works() {
   check_pp_works
 }
 
-# Mac client: an always-on SSH agent with the SSH keys in the agents' vault,
-# started through pp so it logs the shared session back in when it expires.
-# Point ssh at it with `IdentityAgent ~/.ssh/proton-agents.sock`.
+# Every machine: an always-on SSH agent with the SSH keys in the agents' vault,
+# started through pp so it logs the shared session back in when it expires. The pp
+# package's ssh config points ssh at it (`IdentityAgent ~/.ssh/proton-agents.sock`),
+# so no machine keeps a private key on disk. A launchd agent on the Mac, a systemd
+# user service on Linux.
 SSH_AGENT_LABEL="dev.agent-box.proton-ssh-agent"
 SSH_AGENT_PLIST="$HOME/Library/LaunchAgents/$SSH_AGENT_LABEL.plist"
 SSH_AGENT_SOCKET="$HOME/.ssh/proton-agents.sock"
@@ -446,15 +448,54 @@ ssh_agent_plist() {
 </plist>
 EOF
 }
-check_ssh_agent() {
+check_ssh_agent_launchd() {
   ssh_agent_plist | cmp -s - "$SSH_AGENT_PLIST" &&
     launchctl print "gui/$(id -u)/$SSH_AGENT_LABEL" >/dev/null 2>&1
 }
-install_ssh_agent() {
+install_ssh_agent_launchd() {
   mkdir -p "$(dirname "$SSH_AGENT_PLIST")" "$HOME/.ssh" || return 1
   ssh_agent_plist > "$SSH_AGENT_PLIST" || return 1
   launchctl bootout "gui/$(id -u)/$SSH_AGENT_LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$SSH_AGENT_PLIST"
+}
+
+SSH_AGENT_SERVICE="agent-box-proton-ssh-agent.service"
+SSH_AGENT_UNIT="$HOME/.config/systemd/user/$SSH_AGENT_SERVICE"
+ssh_agent_unit() {
+  cat <<EOF
+# Managed by agent-box. SSH agent for the keys in the "$PASS_VAULT" vault.
+[Unit]
+Description=SSH agent for the $PASS_VAULT vault keys (Proton Pass)
+
+[Service]
+Environment=PATH=$BIN_DIR:/usr/local/bin:/usr/bin:/bin
+Environment="PROTON_PASS_AGENT_REASON=SSH agent for $PASS_VAULT vault keys"
+ExecStartPre=/bin/rm -f $SSH_AGENT_SOCKET
+ExecStart=$BIN_DIR/pp ssh-agent start --vault-name $PASS_VAULT --socket-path $SSH_AGENT_SOCKET
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+}
+check_ssh_agent_systemd() {
+  file_is "$SSH_AGENT_UNIT" "$(ssh_agent_unit)" \
+    && systemctl --user is-active --quiet "$SSH_AGENT_SERVICE"
+}
+install_ssh_agent_systemd() {
+  mkdir -p "$(dirname "$SSH_AGENT_UNIT")" "$HOME/.ssh" || return 1
+  ssh_agent_unit > "$SSH_AGENT_UNIT" || return 1
+  systemctl --user daemon-reload || return 1
+  systemctl --user enable --quiet "$SSH_AGENT_SERVICE" || return 1
+  systemctl --user restart "$SSH_AGENT_SERVICE"
+}
+
+check_ssh_agent() {
+  if [ "$PLATFORM" = mac ]; then check_ssh_agent_launchd; else check_ssh_agent_systemd; fi
+}
+install_ssh_agent() {
+  if [ "$PLATFORM" = mac ]; then install_ssh_agent_launchd; else install_ssh_agent_systemd; fi
 }
 
 # Autonomous mode: Bash runs inside Claude's sandbox without prompts, file edits
@@ -1544,7 +1585,7 @@ step "no old agent-box token or pp session" check_no_old_pass       install_no_o
 step "pp (pp package)"                    check_pp                  install_pp
 if have pass-cli && check_token && check_pp; then
   step "pp can log in"                    check_pp_works            install_pp_works
-  if [ "$PLATFORM" = mac ] && [ "$ROLE" = client ]; then
+  if [ "$PLATFORM" = mac ] || has_systemd; then
     step "SSH agent for $PASS_VAULT vault keys (~/.ssh/proton-agents.sock)" check_ssh_agent install_ssh_agent
   fi
 fi
