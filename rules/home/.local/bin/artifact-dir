@@ -1,7 +1,6 @@
 #!/bin/sh
 # artifact-dir <topic>: creates ~/Artifacts/<YYYY-MM-DD>-<topic> and prints its path.
-# Agents save anything the user should see there; the same path on every machine lets
-# one folder sync from hosts to the Mac.
+# Agents save anything the user should see there, so it outlives worktrees and sessions.
 set -eu
 if [ $# -ne 1 ]; then
   echo "usage: artifact-dir <topic>   (for example: artifact-dir memoxia-onboarding)" >&2
