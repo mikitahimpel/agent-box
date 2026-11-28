@@ -68,8 +68,6 @@ For design items, the role order is `designer → implementer → designer-revie
 
 Use the Agent tool. Choose `subagent_type`:
 - `general-purpose` for most implementer/reviewer roles
-- `designer:design-builder` for new UI implementation
-- `designer:design-reviewer` for UI critique (no edits)
 - `Explore` for read-only investigation that informs a later implementer
 - `Plan` when a work item needs an internal plan before implementation
 
