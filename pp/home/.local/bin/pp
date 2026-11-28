@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# pp: pass-cli that logs in with this machine's Proton Pass token when the session
+# has expired. Uses pass-cli's default session, shared with project tools.
+set -euo pipefail
+
+TOKEN_SERVICE="proton-pass-token"
+TOKEN_ACCOUNT="default"
+
+export PATH="$HOME/.local/bin:$PATH"
+export PROTON_PASS_AGENT_REASON="${PROTON_PASS_AGENT_REASON:-agent on $(hostname)}"
+# Off macOS every login session must use the same local key; the Keychain does that on a Mac.
+[[ "$(uname)" == Darwin ]] || export PROTON_PASS_KEY_PROVIDER="${PROTON_PASS_KEY_PROVIDER:-fs}"
+
+token() {
+  if [[ "$(uname)" == Darwin ]]; then
+    security find-generic-password -s "$TOKEN_SERVICE" -a "$TOKEN_ACCOUNT" -w
+    return
+  fi
+  if command -v secret-tool >/dev/null 2>&1 \
+    && secret-tool lookup service "$TOKEN_SERVICE" account "$TOKEN_ACCOUNT" 2>/dev/null; then
+    return
+  fi
+  cat "${XDG_CONFIG_HOME:-$HOME/.config}/proton-pass/token"
+}
+
+if ! pass-cli info >/dev/null 2>&1; then
+  PROTON_PASS_PERSONAL_ACCESS_TOKEN="$(token)" pass-cli login >/dev/null
+fi
+
+exec pass-cli "$@"

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Skills from other people's repos, installed with the skills CLI for Claude Code.
+# -s takes names separated by spaces; a comma list installs nothing.
+set -euo pipefail
+
+emil=(animation-vocabulary apple-design emil-design-eng
+  find-animation-opportunities improve-animations review-animations)
+
+if [[ "$(uname)" == Darwin ]]; then
+  npx -y skills add callstack/agent-device -g -y -a claude-code -s agent-device ios-simulator
+fi
+npx -y skills add emilkowalski/skills -g -y -a claude-code -s "${emil[@]}"
+if command -v rex >/dev/null; then
+  rex skill setup
+fi

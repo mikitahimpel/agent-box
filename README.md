@@ -19,8 +19,20 @@ Windows host: games · Agents off/on · WSL keepalive + hang watchdog · Wi-Fi w
 |---|---|---|
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Safe to rerun. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks. |
-| `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
-| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
+| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill, and other people's skills (post-install) |
+| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
+| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
+| `host/` | hosts | Package: the dev-server rule |
+| `setup/` | every machine | Package without files: its post-install runs `setup.sh install` |
+
+## Packages
+
+Files live in [stow](https://www.gnu.org/software/stow/) packages: a package is a folder whose
+`home/` mirrors `~`, with an optional `Brewfile` for its dependencies and an optional
+`post-install`. On the Mac the [dotfiles](https://github.com/mikitahimpel/dotfiles) install
+links them from its package list (`rules pp rex setup`). A host has no dotfiles yet, so
+`setup.sh` links `rules pp host` itself. `setup.sh` keeps only machine state: the Proton Pass
+token, Tailscale, hosts, the SSH agent, GitHub, and on hosts systemd and memory limits.
 
 ## Install
 
@@ -80,8 +92,11 @@ Pass options through the one-liner with `bash -s --`, e.g. `curl … | bash -s -
 | `install.sh`, `install.ps1` | everywhere / Windows | The one-line installers above |
 | `setup.sh` | WSL, Linux, macOS | Checks the setup and fixes whatever is missing. Installs itself as the `agent-box` command. |
 | `windows/setup.ps1` | Windows (admin PowerShell) | Power, Wi-Fi, WSL memory, Windows Tailscale and SSH, and the keepalive, watchdog, shutdown and snapshot tasks |
-| `claude/` | every machine | Shared Claude config: CLAUDE.md, skills, commands, agents. See [claude/README.md](claude/README.md). |
-| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Agent workflow for Rex: `rex-agent`, `rex-task`, keybindings. See [Rex on the Mac](#rex-on-the-mac). |
+| `rules/` | every machine | Package: rules for agents (`~/.claude/rules/`), `artifact-dir`, the manual `agent-orchestrator` skill, and other people's skills (post-install) |
+| `pp/` | every machine | Package: the `pp` wrapper, the Proton `pass-cli` dependency, and the SSH config that picks the Agents-vault key |
+| `rex/` | macOS with [Rex](https://www.superlogical.com/rex) | Package: Rex agent workflow: `rex-agent`, `rex-task`, `conf.d/agents.lua`, the `rex-placement` skill. See [Rex on the Mac](#rex-on-the-mac). |
+| `host/` | hosts | Package: the dev-server rule |
+| `setup/` | every machine | Package without files: its post-install runs `setup.sh install` |
 
 ## The Windows PC in detail
 
@@ -159,9 +174,9 @@ Agents come back with **Agents on**, or by themselves the next time the PC is tu
 - a watchdog for those runners: every minute, the steps of a pull-request job older than 30 minutes are stopped, so the job fails instead of holding a runner for hours. Deploys and manual runs are never stopped (`journalctl -t agent-box-runner-watchdog`).
 - Claude Code and the sandbox dependencies (`bubblewrap`, `socat`)
 - GitHub: `gh`, git over SSH with this machine's own key, and your git name and email
-- Proton Pass CLI, this machine's Proton Pass token (asked once) and the `pp` wrapper
-- the agent-box section in `~/.claude/CLAUDE.md`: shared working rules and where tasks run (`claude/CLAUDE.md`), secrets usage, and on hosts the dev-server rule
-- links for the shared skills, commands and agents from `claude/`
+- Proton Pass CLI and this machine's Proton Pass token (asked once)
+- `stow`, and links for the `rules`, `pp` and `host` packages: the rules in `~/.claude/rules/`,
+  the skills, `pp` and `artifact-dir`
 
 On a client (the Mac) it sets up the same Claude, GitHub and Proton Pass parts (`pass-cli` from Proton's Homebrew tap, whose signed build keeps its Keychain access across upgrades), an always-on SSH agent with the SSH keys in the agents' vault (launchd `dev.agent-box.proton-ssh-agent`, socket `~/.ssh/proton-agents.sock`; point ssh at it with `IdentityAgent`), plus one `Host` entry per host in `~/.ssh/config` (and `<host>-win` for the Windows side of a WSL host) an hc machine per host, which the Herdr app shows, and a Rex host per host that runs a Rex server. A host must be on for the Mac to add it.
 
@@ -196,13 +211,13 @@ That asks for the Pi's password once, copies agent-box there, runs the host inst
 | Stop | `agent-box off` from the Mac (Windows shuts down within ~2 min), or a short press of the power button. `agent-box off pi` for the Pi. |
 | Restart | `agent-box restart` from the Mac (Windows restarts within ~2 min and comes back on its own). |
 | Open an app an agent started | `http://pc:<port>` in the Mac's browser. Agents on hosts are told to bind dev servers to `0.0.0.0` and give you this URL. |
-| Change shared Claude config | Edit `claude/` in the repo, push, then `agent-box sync` on each machine. |
+| Change rules or skills | Edit the package, merge, then `dotfiles update` on the Mac and `agent-box sync` on each host. |
 | Game | **Agents off** on the PC's desktop first; **Agents on** (or the next power-on) brings them back. |
 | Updates | Use **Restart** now and then for a full, clean boot. |
 
 ## Rex on the Mac
 
-[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. When it is installed, `agent-box install` links the files in `rex/` and adds `require("agents")` to `~/.config/rex/init.lua`. If `init.lua` (or the login profile `~/.zprofile`) is a link into your own dotfiles, agent-box never writes through it: it checks that the line is there and tells you what to add. Each host also runs a Rex server, and the Mac adds it as a Rex host reached over SSH, so `rex -S pc new myproject` or the Rex app opens sessions on **pc** (see [Rex on hosts](#rex-on-hosts)). The agent workflow below (`rex-agent`, `rex-task`) still runs agents on the Mac only.
+[Rex](https://www.superlogical.com/rex) is a native Mac terminal multiplexer. The `rex` package puts `agents.lua` in `~/.config/rex/conf.d/`, which the dotfiles `init.lua` loads, and `rex-agent` and `rex-task` in `~/.local/bin`. Each host also runs a Rex server, and the Mac adds it as a Rex host reached over SSH, so `rex -S pc new myproject` or the Rex app opens sessions on **pc** (see [Rex on hosts](#rex-on-hosts)). The agent workflow below (`rex-agent`, `rex-task`) still runs agents on the Mac only.
 
 Claude Code reports its state to Rex itself (Program Status Protocol), so tabs show a spinner while an agent works and the session picker marks agents that are blocked or done. The pieces on top:
 
@@ -239,7 +254,7 @@ hc and the Herdr app keep working beside it, so you can move over gradually. Rex
 - **Sandbox on:** Bash commands run inside Claude's sandbox (bubblewrap on Linux/WSL, built in on macOS) and need no approval.
 - **No escape:** commands can't fall back to running outside the sandbox, and Claude refuses to start if the sandbox is unavailable instead of silently running without it.
 - **Edits auto-approved:** file edits don't ask (`acceptEdits`).
-- **Network allowlist:** sandboxed commands may reach the hosts in [claude/allowed-domains.txt](claude/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file and run `agent-box sync`.
+- **Network allowlist:** sandboxed commands may reach the hosts in [setup/allowed-domains.txt](setup/allowed-domains.txt) (GitHub, npm, PyPI, crates, Go, Proton) without asking. Any other host still prompts once, so add the ones you need to the file and run `agent-box sync`.
 
 `--autonomous off` stops managing these settings but doesn't remove them. Undo with `/sandbox` inside Claude or by restoring `settings.json.bak`.
 
@@ -279,7 +294,7 @@ Which vaults the token covers depends on the machine:
 2. The install asks for the token once and stores it as above.
 3. `pp` wraps `pass-cli` from your PATH. Agent sessions last 2 hours; when `pass-cli info` fails, `pp` logs back in with `PROTON_PASS_PERSONAL_ACCESS_TOKEN=<token> pass-cli login`. Every read is labelled with `PROTON_PASS_AGENT_REASON` (default `agent on <hostname>`).
 
-Agents use it like this (the `~/.claude/CLAUDE.md` block tells them to):
+Agents use it like this (the secrets rule in `~/.claude/rules/` tells them to):
 ```bash
 # .env
 API_KEY=pass://Agents/<item>/<field>

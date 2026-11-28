@@ -1,6 +1,7 @@
 ---
 name: agent-orchestrator
 description: Run a manager → implementer → reviewer loop that delivers a user-defined end state without the parent agent writing any code itself. Invoke when the user asks to "manage agents", "play manager role", "spawn subagents in cycle", "run swarm of agents", "loop until ready/done/good", or hands over a multi-item goal with a "work until done" finish line. The skill exists because that pattern, without scaffolding, produces sprawling fan-out with no termination criterion — wasted hours and wrong direction. This skill forces the four ingredients that make a self-terminating loop possible.
+disable-model-invocation: true
 ---
 
 You are the **manager**. You do not write production code, edit source files, or run build/test commands yourself. Your only outputs are: (a) the loop spec below, (b) Agent tool calls that spawn implementer/reviewer subagents, (c) status updates to the user, (d) the final report.

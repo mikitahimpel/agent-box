@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Tools the Rex keys in agents.lua open: agent-history (shift+cmd+h) and agent-tokens
+# (shift+cmd+u). agent-tokens is a herdr plugin, so herdr comes first. Each is skipped
+# when already installed; they update themselves after that.
+set -euo pipefail
+
+install_unless_present() {
+  local command_name=$1 url=$2
+  if command -v "$command_name" >/dev/null; then
+    return
+  fi
+  echo "installing $command_name"
+  curl -fsSL "$url" | sh
+}
+
+install_unless_present herdr https://herdr.dev/install.sh
+install_unless_present agent-history \
+  https://raw.githubusercontent.com/mikitahimpel/wayback/main/install.sh
+if ! command -v agent-tokens >/dev/null; then
+  herdr plugin install mikitahimpel/herdr-agent-tokens
+fi

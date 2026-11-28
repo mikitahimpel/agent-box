@@ -1,6 +1,6 @@
 -- Agent workflow for Rex: worktree tasks, agent history, token usage, and
--- jumping to the agent that needs you. Loaded from init.lua with
--- require("agents"). The commands it runs are installed in ~/.local/bin.
+-- jumping to the agent that needs you. init.lua loads every file in conf.d.
+-- The commands it runs are in ~/.local/bin, from the same package.
 
 local shell = "com.superlogical.terminal.shell"
 local terminal = "com.superlogical.terminal"
